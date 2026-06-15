@@ -8,3 +8,15 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# User-local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
