@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[mcp,dev]"
+
+      - name: Lint (ruff)
+        run: ruff check shellsage/ tests/
+
+      - name: Format check (ruff)
+        run: ruff format --check shellsage/ tests/
+
+      - name: Type check (mypy)
+        run: mypy shellsage/
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --no-header
+        env:
+          # Tests use mocked Qdrant — no server needed
+          SHELLSAGE_QDRANT_URL: "http://localhost:6333"
+
+  seed-validate:
+    name: Validate seed data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Validate seed integrity
+        run: python -c "from shellsage.seed import SEED_TRANSLATIONS; print(f'Seed OK: {len(SEED_TRANSLATIONS)} translations')"
+      - name: Validate rules load
+        run: python -c "from shellsage.rules import _RULES; print(f'Rules OK: {len(_RULES)} patterns')"
+      - name: Smoke-test translation (rules layer)
+        run: |
+          python - <<'EOF'
+          from shellsage.models import Shell, ShellContext, OS
+          from shellsage.rules import apply
+
+          cases = [
+              ("ls -la", "Get-ChildItem"),
+              ("rm -rf dist/", "Remove-Item"),
+              ("find . -name '*.py'", "Get-ChildItem"),
+              ("grep -r 'TODO' .", "Select-String"),
+              ("python3 app.py", "python app.py"),
+              ("export PORT=3000", "$env:PORT"),
+              ("kill -9 1234", "Stop-Process"),
+              ("curl -s https://api.example.com", "Invoke-RestMethod"),
+          ]
+
+          failed = []
+          for bash, expected_fragment in cases:
+              result = apply(bash, Shell.POWERSHELL)
+              if expected_fragment.lower() not in result.lower():
+                  failed.append(f"FAIL: {bash!r} → {result!r} (expected {expected_fragment!r})")
+              else:
+                  print(f"  OK: {bash!r} → {result!r}")
+
+          if failed:
+              for f in failed:
+                  print(f)
+              raise SystemExit(1)
+          print(f"\nAll {len(cases)} smoke tests passed.")
+          EOF

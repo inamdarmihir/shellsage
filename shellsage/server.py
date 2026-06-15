@@ -9,7 +9,7 @@ from shellsage.models import OS, CommandOutcome, Shell, ShellContext, Translatio
 from shellsage.translator import store_outcome, translate
 
 try:
-    from fastmcp import FastMCP  # type: ignore
+    from mcp.server.fastmcp import FastMCP  # type: ignore
 except ImportError as e:
     raise ImportError("MCP support requires the 'mcp' extra: pip install 'shellsage[mcp]'") from e
 

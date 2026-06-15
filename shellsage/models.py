@@ -30,11 +30,11 @@ class ShellContext:
     os: OS
     shell: Shell
     shell_version: str
-    project_type: str  # e.g. "python", "node", "dotnet", "unknown"
+    project_type: str  # "python" | "node" | "rust" | "go" | "dotnet" | "java" | "unknown"
     project_root: str
 
     @classmethod
-    def detect(cls, project_root: str = ".") -> ShellContext:
+    def detect(cls, project_root: str = ".") -> "ShellContext":
         """Auto-detect the current runtime environment."""
         os_name = _detect_os()
         shell, shell_version = _detect_shell()
@@ -59,13 +59,13 @@ class ShellContext:
 
 @dataclass
 class Translation:
-    """A resolved bash→target-shell mapping."""
+    """A resolved bash → target-shell mapping."""
 
     original: str
     translated: str
     shell: Shell
     confidence: float
-    source: str  # "qdrant" | "seed" | "passthrough"
+    source: str  # "qdrant" | "rules" | "passthrough"
 
     @property
     def was_changed(self) -> bool:
@@ -105,7 +105,6 @@ def _detect_os() -> OS:
 
 def _detect_shell() -> tuple[Shell, str]:
     """Return (Shell enum, version string)."""
-    # Claude Code sets SHELL on Unix; on Windows we check for pwsh/powershell.
     import os
 
     shell_env = os.environ.get("SHELL", "")
@@ -124,7 +123,7 @@ def _detect_shell() -> tuple[Shell, str]:
             return Shell.POWERSHELL, _run_version(
                 "powershell -NoProfile -Command $PSVersionTable.PSVersion.ToString()"
             )
-        return Shell.CMD, "unknown"
+        return Shell.POWERSHELL, "unknown"  # Windows always has PowerShell
 
     return Shell.BASH, _run_version("bash --version")
 
@@ -136,21 +135,25 @@ def _detect_project_type(root: str) -> str:
         ("package.json", "node"),
         ("pyproject.toml", "python"),
         ("setup.py", "python"),
+        ("setup.cfg", "python"),
         ("Cargo.toml", "rust"),
         ("go.mod", "go"),
-        ("*.csproj", "dotnet"),
-        ("*.sln", "dotnet"),
         ("pom.xml", "java"),
         ("build.gradle", "java"),
+        ("*.csproj", "dotnet"),
+        ("*.sln", "dotnet"),
     ]
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return "unknown"
+
     for marker, ptype in markers:
         if "*" in marker:
             ext = marker.replace("*", "")
-            if any(
-                f.endswith(ext) for f in os.listdir(root) if os.path.isfile(os.path.join(root, f))
-            ):
+            if any(f.endswith(ext) for f in entries if os.path.isfile(os.path.join(root, f))):
                 return ptype
-        elif os.path.exists(os.path.join(root, marker)):
+        elif marker in entries:
             return ptype
     return "unknown"
 

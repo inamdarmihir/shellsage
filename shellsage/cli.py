@@ -1,4 +1,4 @@
-"""ShellSage CLI — shellsage init | translate | stats | replay | mcp"""
+"""ShellSage CLI — shellsage init | translate | stats | replay | mcp | hooks"""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import sys
 import click
 from rich.console import Console
 from rich.table import Table
+
+from shellsage.config import QDRANT_URL as _DEFAULT_URL, SEED_CONFIDENCE
 
 console = Console()
 
@@ -19,7 +21,7 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--qdrant-url", default="http://localhost:6333", show_default=True)
+@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
 def init(qdrant_url: str) -> None:
     """Initialise Qdrant collections and load seed translations."""
     from shellsage import embedder, store
@@ -42,28 +44,33 @@ def init(qdrant_url: str) -> None:
     with console.status(f"Embedding {len(SEED_TRANSLATIONS)} seed translations…"):
         bash_cmds = [s["bash"] for s in SEED_TRANSLATIONS]
         vectors = embedder.embed_batch(bash_cmds)
+        loaded = 0
         for seed, vec in zip(SEED_TRANSLATIONS, vectors, strict=False):
-            store.upsert_translation(
-                bash_cmd=seed["bash"],
-                translated_cmd=seed["ps"],
-                shell="powershell",
-                os_name="windows",
-                project_type="unknown",
-                confidence=0.95,
-                embedding=vec,
-                url=qdrant_url,
-            )
-    console.print(f"  [green]✓[/green] {len(SEED_TRANSLATIONS)} seed translations loaded")
+            try:
+                store.upsert_translation(
+                    bash_cmd=seed["bash"],
+                    translated_cmd=seed["ps"],
+                    shell="powershell",
+                    os_name="windows",
+                    project_type="unknown",
+                    confidence=SEED_CONFIDENCE,
+                    embedding=vec,
+                    url=qdrant_url,
+                )
+                loaded += 1
+            except Exception:
+                pass
+    console.print(f"  [green]✓[/green] {loaded}/{len(SEED_TRANSLATIONS)} seed translations loaded")
 
-    console.print("\n[bold green]Ready.[/bold green]  Add to Claude Code:")
+    console.print("\n[bold green]Ready.[/bold green]  Register with Claude Code:")
     console.print("  [dim]claude mcp add shellsage -- shellsage mcp[/dim]")
-    console.print("\nAdd hooks to [dim].claude/settings.json[/dim]:  shellsage hooks install")
+    console.print("\nInstall hooks:  shellsage hooks install")
 
 
 @main.command()
 @click.argument("command")
 @click.option("--project-root", default=".", show_default=True)
-@click.option("--qdrant-url", default="http://localhost:6333", show_default=True)
+@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
 @click.option("--json-out", is_flag=True, default=False)
 def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) -> None:
     """Translate a single command and print the result."""
@@ -75,15 +82,13 @@ def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) 
 
     if json_out:
         click.echo(
-            json.dumps(
-                {
-                    "original": result.original,
-                    "translated": result.translated,
-                    "changed": result.was_changed,
-                    "confidence": round(result.confidence, 3),
-                    "source": result.source,
-                }
-            )
+            json.dumps({
+                "original": result.original,
+                "translated": result.translated,
+                "changed": result.was_changed,
+                "confidence": round(result.confidence, 3),
+                "source": result.source,
+            })
         )
         return
 
@@ -96,9 +101,9 @@ def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) 
 
 
 @main.command()
-@click.option("--qdrant-url", default="http://localhost:6333", show_default=True)
+@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
 def stats(qdrant_url: str) -> None:
-    """Show Qdrant collection counts and recent failure patterns."""
+    """Show Qdrant collection counts."""
     from shellsage import store
 
     try:
@@ -116,7 +121,7 @@ def stats(qdrant_url: str) -> None:
 
 
 @main.command()
-@click.option("--qdrant-url", default="http://localhost:6333", show_default=True)
+@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
 @click.option("--limit", default=20, show_default=True)
 def replay(qdrant_url: str, limit: int) -> None:
     """Show recent failure patterns stored in Qdrant."""
@@ -212,7 +217,10 @@ def _write_hook(path: str, content: str) -> None:
 _PRE_TOOL_USE_SCRIPT = '''\
 #!/usr/bin/env python3
 """PreToolUse hook — translates bash commands before Claude Code executes them."""
-import json, sys
+import json
+import os
+import sys
+import tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -225,14 +233,25 @@ if not command:
 try:
     from shellsage.models import ShellContext
     from shellsage.translator import translate
+
     ctx = ShellContext.detect()
     result = translate(command, ctx)
     if result.was_changed:
+        cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
+        try:
+            with open(cache_path, "w") as fh:
+                json.dump({"original": result.original, "translated": result.translated}, fh)
+        except Exception:
+            pass
+
         event["tool_input"]["command"] = result.translated
-        print(json.dumps({"decision": "approve", "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "updatedInput": event["tool_input"],
-        }}))
+        print(json.dumps({
+            "decision": "approve",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "updatedInput": event["tool_input"],
+            },
+        }))
         sys.exit(0)
 except Exception:
     pass  # never block the agent
@@ -243,7 +262,10 @@ sys.exit(0)
 _POST_TOOL_USE_SCRIPT = '''\
 #!/usr/bin/env python3
 """PostToolUse hook — stores command outcomes back to Qdrant."""
-import json, sys
+import json
+import os
+import sys
+import tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -259,12 +281,26 @@ if not command:
     sys.exit(0)
 
 try:
-    from shellsage.models import CommandOutcome, OS, Shell, ShellContext
+    from shellsage.models import CommandOutcome, ShellContext
     from shellsage.translator import store_outcome
+
     ctx = ShellContext.detect()
+
+    original   = command
+    translated = command
+    cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
+    try:
+        with open(cache_path) as fh:
+            cached = json.load(fh)
+        original   = cached.get("original", command)
+        translated = cached.get("translated", command)
+        os.remove(cache_path)
+    except Exception:
+        pass
+
     outcome = CommandOutcome(
-        original=command,
-        translated=command,
+        original=original,
+        translated=translated,
         shell=ctx.shell,
         os=ctx.os,
         project_type=ctx.project_type,

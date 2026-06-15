@@ -73,7 +73,7 @@ def test_translate_qdrant_miss_falls_to_rules(mock_embed, mock_query):
     mock_query.return_value = []  # no hits
     ctx = _ps_ctx()
     result = translate("ls -la", ctx)
-    assert result.source == "seed"
+    assert result.source == "rules"
     assert "Get-ChildItem" in result.translated
 
 
@@ -88,7 +88,7 @@ def test_translate_qdrant_unavailable_falls_to_rules(mock_embed, mock_query):
     result = translate("ls -la", ctx)
     # Should still succeed via rules — never raise
     assert result.translated is not None
-    assert result.source in ("seed", "passthrough")
+    assert result.source in ("rules", "passthrough")
 
 
 # ── unknown command passthrough ───────────────────────────────────────────────

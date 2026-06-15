@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import logging
+
 from shellsage import embedder, rules, store
+from shellsage.config import QDRANT_URL as _QDRANT_URL, SCORE_THRESHOLD, OUTCOME_CONFIDENCE
 from shellsage.models import CommandOutcome, ShellContext, Translation
 
-_QDRANT_URL = "http://localhost:6333"
-_SCORE_THRESHOLD = 0.82
+logger = logging.getLogger(__name__)
 
 
-def translate(command: str, ctx: ShellContext, qdrant_url: str = _QDRANT_URL) -> Translation:
+def translate(
+    command: str,
+    ctx: ShellContext,
+    qdrant_url: str = _QDRANT_URL,
+    score_threshold: float = SCORE_THRESHOLD,
+) -> Translation:
     """
     Translate *command* for the given shell context.
 
     Resolution order:
-      1. Qdrant semantic lookup  (learned from past sessions)
-      2. Rule-based translation  (built-in patterns, no Qdrant needed)
-      3. Passthrough             (command is already compatible)
+      1. Qdrant hybrid search  (learned from past sessions + seed)
+      2. Rule-based translation (built-in patterns, no Qdrant needed)
+      3. Passthrough            (command already compatible)
     """
     if not ctx.needs_translation:
         return Translation(
@@ -36,7 +43,7 @@ def translate(command: str, ctx: ShellContext, qdrant_url: str = _QDRANT_URL) ->
             shell=ctx.shell.value,
             os_name=ctx.os.value,
             project_type=ctx.project_type,
-            score_threshold=_SCORE_THRESHOLD,
+            score_threshold=score_threshold,
             url=qdrant_url,
         )
         if hits:
@@ -48,9 +55,8 @@ def translate(command: str, ctx: ShellContext, qdrant_url: str = _QDRANT_URL) ->
                 confidence=best["score"],
                 source="qdrant",
             )
-    except Exception:
-        # Qdrant unavailable — fall through to rules
-        pass
+    except Exception as exc:
+        logger.debug("Qdrant lookup failed (%s) — falling back to rules", exc)
 
     # ── 2. Rule-based translation ─────────────────────────────────────────────
     translated = rules.apply(command, ctx.shell)
@@ -60,7 +66,7 @@ def translate(command: str, ctx: ShellContext, qdrant_url: str = _QDRANT_URL) ->
             translated=translated,
             shell=ctx.shell,
             confidence=0.95,
-            source="seed",
+            source="rules",
         )
 
     # ── 3. Passthrough ────────────────────────────────────────────────────────
@@ -89,7 +95,7 @@ def store_outcome(outcome: CommandOutcome, qdrant_url: str = _QDRANT_URL) -> Non
                 shell=outcome.shell.value,
                 os_name=outcome.os.value,
                 project_type=outcome.project_type,
-                confidence=0.99,
+                confidence=OUTCOME_CONFIDENCE,
                 embedding=vec,
                 url=qdrant_url,
             )
@@ -103,6 +109,5 @@ def store_outcome(outcome: CommandOutcome, qdrant_url: str = _QDRANT_URL) -> Non
                 embedding=vec,
                 url=qdrant_url,
             )
-    except Exception:
-        # Storage failures are non-fatal — agent session continues
-        pass
+    except Exception as exc:
+        logger.debug("store_outcome failed (%s) — skipping", exc)
