@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 
-from shellsage import store
 from shellsage.models import OS, CommandOutcome, Shell, ShellContext, Translation
 from shellsage.translator import store_outcome, translate
 
@@ -64,8 +63,8 @@ def store_command_result(
         exit_code=exit_code,
         error_snippet=error_snippet[:300],
     )
-    store_outcome(outcome, qdrant_url=_QDRANT_URL)
-    return {"stored": True, "succeeded": outcome.succeeded}
+    stored = store_outcome(outcome, qdrant_url=_QDRANT_URL)
+    return {"stored": stored, "succeeded": outcome.succeeded}
 
 
 @mcp.tool()
@@ -85,6 +84,8 @@ def get_shell_context(project_root: str = ".") -> dict:
 def get_stats() -> dict:
     """Return collection sizes from local Qdrant — useful for health checks."""
     try:
+        from shellsage import store
+
         counts = store.get_collection_counts(url=_QDRANT_URL)
         return {"status": "ok", "collections": counts}
     except Exception as exc:

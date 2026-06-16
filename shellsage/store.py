@@ -100,7 +100,7 @@ def _compute_bm25_scores(
 
     N = len(documents)
     scored_candidates = []
-    for doc, tokens, doc_len in zip(documents, doc_tokens_list, doc_lengths):
+    for doc, tokens, doc_len in zip(documents, doc_tokens_list, doc_lengths, strict=False):
         score = 0.0
         # Term frequencies in this document
         tf: dict[str, int] = {}
@@ -118,11 +118,11 @@ def _compute_bm25_scores(
             denom = f_q + k1 * (1.0 - b + b * (doc_len / avg_doc_len))
             if denom > 0:
                 score += idf * (f_q * (k1 + 1.0)) / denom
-        
+
         doc_copy = doc.copy()
         doc_copy["score"] = score
         scored_candidates.append((doc_copy, score))
-        
+
     scored_candidates.sort(key=lambda x: x[1], reverse=True)
     return scored_candidates
 
@@ -134,7 +134,7 @@ def _reciprocal_rank_fusion(
     limit: int = 3,
 ) -> list[dict]:
     candidates = {}
-    
+
     # Ranks in semantic
     semantic_ranks = {}
     for idx, item in enumerate(semantic_results):
@@ -160,14 +160,14 @@ def _reciprocal_rank_fusion(
 
     # Sort candidates by RRF score descending
     sorted_cmds = sorted(rrf_scores.keys(), key=lambda c: rrf_scores[c], reverse=True)
-    
+
     results = []
     for cmd in sorted_cmds[:limit]:
         item = candidates[cmd].copy()
         if cmd not in semantic_ranks:
             item["score"] = max(0.85, item.get("score", 0.0))
         results.append(item)
-        
+
     return results
 
 
@@ -188,7 +188,7 @@ def query_translation(
         qm.FieldCondition(key="shell", match=qm.MatchValue(value=shell)),
         qm.FieldCondition(key="os", match=qm.MatchValue(value=os_name)),
     ]
-    
+
     # 1. Semantic search
     semantic_hits = []
     try:

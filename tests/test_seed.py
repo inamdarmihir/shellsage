@@ -1,6 +1,6 @@
 """Validate seed translation data integrity."""
 
-from shellsage.seed import SEED_TRANSLATIONS
+from shellsage.seed import SEED_TRANSLATIONS, select_seed_translations
 
 
 def test_seed_not_empty():
@@ -9,6 +9,16 @@ def test_seed_not_empty():
 
 def test_seed_minimum_count():
     assert len(SEED_TRANSLATIONS) >= 50
+
+
+def test_select_seed_translations_respects_limit():
+    selected = select_seed_translations(10)
+    assert len(selected) == 10
+    assert selected == SEED_TRANSLATIONS[:10]
+
+
+def test_select_seed_translations_all_when_limit_is_none():
+    assert select_seed_translations(None) == SEED_TRANSLATIONS
 
 
 def test_seed_all_have_bash_and_ps():

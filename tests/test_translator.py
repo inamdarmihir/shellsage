@@ -40,15 +40,13 @@ def test_translate_passthrough_on_bash():
 # ── Qdrant hit ────────────────────────────────────────────────────────────────
 
 
-@patch("shellsage.translator.store.query_translation")
-@patch("shellsage.translator.embedder.embed")
-def test_translate_qdrant_hit(mock_embed, mock_query):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._query_qdrant")
+def test_translate_qdrant_hit(mock_query):
     mock_query.return_value = [
         {
             "score": 0.95,
-            "bash_cmd": "ls -la",
-            "translated_cmd": "Get-ChildItem -Force",
+            "bash_cmd": "custom-find-latest",
+            "translated_cmd": "Get-ChildItem | Sort-Object LastWriteTime -Descending | Select-Object -First 1",
             "shell": "powershell",
             "os": "windows",
             "project_type": "python",
@@ -57,33 +55,30 @@ def test_translate_qdrant_hit(mock_embed, mock_query):
         }
     ]
     ctx = _ps_ctx()
-    result = translate("ls -la", ctx)
+    result = translate("custom-find-latest", ctx)
     assert result.source == "qdrant"
-    assert result.translated == "Get-ChildItem -Force"
+    assert result.translated.startswith("Get-ChildItem")
     assert result.confidence == 0.95
 
 
 # ── Qdrant miss → rule fallback ───────────────────────────────────────────────
 
 
-@patch("shellsage.translator.store.query_translation")
-@patch("shellsage.translator.embedder.embed")
-def test_translate_qdrant_miss_falls_to_rules(mock_embed, mock_query):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._query_qdrant")
+def test_translate_qdrant_miss_falls_to_rules(mock_query):
     mock_query.return_value = []  # no hits
     ctx = _ps_ctx()
     result = translate("ls -la", ctx)
     assert result.source == "rules"
     assert "Get-ChildItem" in result.translated
+    mock_query.assert_not_called()
 
 
 # ── Qdrant unavailable → rule fallback ───────────────────────────────────────
 
 
-@patch("shellsage.translator.store.query_translation", side_effect=ConnectionError("down"))
-@patch("shellsage.translator.embedder.embed")
-def test_translate_qdrant_unavailable_falls_to_rules(mock_embed, mock_query):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._query_qdrant", side_effect=ConnectionError("down"))
+def test_translate_qdrant_unavailable_falls_to_rules(mock_query):
     ctx = _ps_ctx()
     result = translate("ls -la", ctx)
     # Should still succeed via rules — never raise
@@ -94,11 +89,17 @@ def test_translate_qdrant_unavailable_falls_to_rules(mock_embed, mock_query):
 # ── unknown command passthrough ───────────────────────────────────────────────
 
 
-@patch("shellsage.translator.store.query_translation")
-@patch("shellsage.translator.embedder.embed")
-def test_translate_unknown_command(mock_embed, mock_query):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._query_qdrant")
+def test_translate_unknown_command(mock_query):
     mock_query.return_value = []
+    ctx = _ps_ctx()
+    result = translate("some-exotic-tool --flag", ctx)
+    assert result.source == "passthrough"
+    assert result.translated == "some-exotic-tool --flag"
+
+
+@patch("shellsage.translator._query_qdrant", side_effect=ModuleNotFoundError("qdrant_client"))
+def test_translate_without_vector_dependencies_still_works(mock_query):
     ctx = _ps_ctx()
     result = translate("some-exotic-tool --flag", ctx)
     assert result.source == "passthrough"
@@ -108,10 +109,8 @@ def test_translate_unknown_command(mock_embed, mock_query):
 # ── store_outcome success ─────────────────────────────────────────────────────
 
 
-@patch("shellsage.translator.store.upsert_translation")
-@patch("shellsage.translator.embedder.embed")
-def test_store_outcome_success(mock_embed, mock_upsert):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._store_to_qdrant")
+def test_store_outcome_success(mock_store):
     outcome = CommandOutcome(
         original="ls -la",
         translated="Get-ChildItem -Force",
@@ -120,21 +119,15 @@ def test_store_outcome_success(mock_embed, mock_upsert):
         project_type="python",
         exit_code=0,
     )
-    store_outcome(outcome)
-    mock_upsert.assert_called_once()
-    call_kwargs = mock_upsert.call_args.kwargs
-    assert call_kwargs["bash_cmd"] == "ls -la"
-    assert call_kwargs["translated_cmd"] == "Get-ChildItem -Force"
-    assert call_kwargs["confidence"] == 0.99
+    assert store_outcome(outcome) is True
+    mock_store.assert_called_once_with(outcome, "http://localhost:6333")
 
 
 # ── store_outcome failure ─────────────────────────────────────────────────────
 
 
-@patch("shellsage.translator.store.upsert_failure")
-@patch("shellsage.translator.embedder.embed")
-def test_store_outcome_failure(mock_embed, mock_upsert_failure):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._store_to_qdrant")
+def test_store_outcome_failure(mock_store):
     outcome = CommandOutcome(
         original="ls -la",
         translated="ls -la",
@@ -144,17 +137,15 @@ def test_store_outcome_failure(mock_embed, mock_upsert_failure):
         exit_code=1,
         error_snippet="term 'ls' not recognized",
     )
-    store_outcome(outcome)
-    mock_upsert_failure.assert_called_once()
+    assert store_outcome(outcome) is True
+    mock_store.assert_called_once_with(outcome, "http://localhost:6333")
 
 
 # ── store_outcome never raises ────────────────────────────────────────────────
 
 
-@patch("shellsage.translator.store.upsert_translation", side_effect=Exception("boom"))
-@patch("shellsage.translator.embedder.embed")
-def test_store_outcome_swallows_errors(mock_embed, mock_upsert):
-    mock_embed.return_value = [0.1] * 384
+@patch("shellsage.translator._store_to_qdrant", side_effect=Exception("boom"))
+def test_store_outcome_swallows_errors(mock_store):
     outcome = CommandOutcome(
         original="ls",
         translated="Get-ChildItem",
@@ -164,4 +155,4 @@ def test_store_outcome_swallows_errors(mock_embed, mock_upsert):
         exit_code=0,
     )
     # Must not raise — storage failures are non-fatal
-    store_outcome(outcome)
+    assert store_outcome(outcome) is False

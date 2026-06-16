@@ -8,14 +8,16 @@ Rules are ordered from most-specific to least-specific so the first match wins.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from shellsage.models import Shell
 
 # Each entry: (compiled_pattern, powershell_replacement_or_callable)
-_RULES: list[tuple[re.Pattern, object]] = []
+_Replacement = str | Callable[[re.Match[str]], str]
+_RULES: list[tuple[re.Pattern[str], _Replacement]] = []
 
 
-def _rule(pattern: str, replacement: object) -> None:
+def _rule(pattern: str, replacement: _Replacement) -> None:
     _RULES.append((re.compile(pattern, re.IGNORECASE), replacement))
 
 
@@ -119,12 +121,17 @@ _rule(
 )
 
 # ── cat ───────────────────────────────────────────────────────────────────────
-_rule(r"^cat\s+-n\s+([^|]+)$",
-      lambda m: f"Get-Content '{m.group(1).strip()}' | ForEach-Object -Begin {{$i=1}} -Process {{\"{{0,4}}: {{1}}\" -f $i++,$_}}")
+_rule(
+    r"^cat\s+-n\s+([^|]+)$",
+    lambda m: f"Get-Content '{m.group(1).strip()}' | ForEach-Object -Begin {{$i=1}} -Process {{\"{{0,4}}: {{1}}\" -f $i++,$_}}",
+)
 _rule(r"^cat\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}'")
 
 # ── mkdir ─────────────────────────────────────────────────────────────────────
-_rule(r"^mkdir\s+-p\s+([^|]+)$", lambda m: f"New-Item -ItemType Directory -Force -Path '{m.group(1).strip()}'")
+_rule(
+    r"^mkdir\s+-p\s+([^|]+)$",
+    lambda m: f"New-Item -ItemType Directory -Force -Path '{m.group(1).strip()}'",
+)
 _rule(r"^mkdir\s+([^|]+)$", lambda m: f"New-Item -ItemType Directory -Path '{m.group(1).strip()}'")
 
 # ── rm ────────────────────────────────────────────────────────────────────────
@@ -141,13 +148,25 @@ _rule(r"^mv\s+(\S+)\s+(\S+)$", lambda m: f"Move-Item '{m.group(1)}' '{m.group(2)
 
 # ── touch / ln ────────────────────────────────────────────────────────────────
 _rule(r"^touch\s+([^|]+)$", lambda m: f"New-Item -ItemType File -Force '{m.group(1).strip()}'")
-_rule(r"^ln\s+-s\s+(\S+)\s+(\S+)$", lambda m: f"New-Item -ItemType SymbolicLink -Name '{m.group(2)}' -Target '{m.group(1)}'")
-_rule(r"^ln\s+(\S+)\s+(\S+)$", lambda m: f"New-Item -ItemType HardLink -Name '{m.group(2)}' -Target '{m.group(1)}'")
+_rule(
+    r"^ln\s+-s\s+(\S+)\s+(\S+)$",
+    lambda m: f"New-Item -ItemType SymbolicLink -Name '{m.group(2)}' -Target '{m.group(1)}'",
+)
+_rule(
+    r"^ln\s+(\S+)\s+(\S+)$",
+    lambda m: f"New-Item -ItemType HardLink -Name '{m.group(2)}' -Target '{m.group(1)}'",
+)
 
 # ── echo / printf ─────────────────────────────────────────────────────────────
 _rule(r"^echo\s+\$(\w+)$", lambda m: f"$env:{m.group(1)}")
-_rule(r"^echo\s+(.+)\s*>>\s*(.+)$", lambda m: f"Add-Content '{m.group(2).strip()}' '{m.group(1).strip()}'")
-_rule(r"^echo\s+(.+)\s*>\s*(.+)$", lambda m: f"Set-Content '{m.group(2).strip()}' '{m.group(1).strip()}'")
+_rule(
+    r"^echo\s+(.+)\s*>>\s*(.+)$",
+    lambda m: f"Add-Content '{m.group(2).strip()}' '{m.group(1).strip()}'",
+)
+_rule(
+    r"^echo\s+(.+)\s*>\s*(.+)$",
+    lambda m: f"Set-Content '{m.group(2).strip()}' '{m.group(1).strip()}'",
+)
 _rule(r"^echo\s+([^|]+)$", lambda m: f"Write-Output '{m.group(1).strip()}'")
 _rule(r"^printf\s+'([^']+)'$", lambda m: f"Write-Output '{m.group(1)}'")
 
@@ -170,7 +189,9 @@ _rule(r"^kill\s+-9\s+(\d+)$", lambda m: f"Stop-Process -Id {m.group(1)} -Force")
 _rule(r"^kill\s+(-SIGTERM\s+)?(\d+)$", lambda m: f"Stop-Process -Id {m.group(2)}")
 _rule(r"^killall\s+(\S+)$", lambda m: f"Stop-Process -Name '{m.group(1)}' -Force")
 _rule(r"^sleep\s+(\d+)$", lambda m: f"Start-Sleep {m.group(1)}")
-_rule(r"^sleep\s+(\d+\.\d+)$", lambda m: f"Start-Sleep -Milliseconds {int(float(m.group(1))*1000)}")
+_rule(
+    r"^sleep\s+(\d+\.\d+)$", lambda m: f"Start-Sleep -Milliseconds {int(float(m.group(1)) * 1000)}"
+)
 
 # ── networking ────────────────────────────────────────────────────────────────
 _rule(
@@ -195,9 +216,18 @@ _rule(
     r"^wget\s+-O\s+(\S+)\s+([^\s]+)$",
     lambda m: f"Invoke-WebRequest -Uri '{m.group(2)}' -OutFile '{m.group(1)}'",
 )
-_rule(r"^wget\s+-q\s+([^|]+)$", lambda m: f"Invoke-WebRequest -Uri '{m.group(1).strip()}' -OutFile 'download'")
-_rule(r"^wget\s+([^|]+)$", lambda m: f"Invoke-WebRequest -Uri '{m.group(1).strip()}' -OutFile './download'")
-_rule(r"^ping\s+-c\s+(\d+)\s+(\S+)$", lambda m: f"Test-Connection -ComputerName '{m.group(2)}' -Count {m.group(1)}")
+_rule(
+    r"^wget\s+-q\s+([^|]+)$",
+    lambda m: f"Invoke-WebRequest -Uri '{m.group(1).strip()}' -OutFile 'download'",
+)
+_rule(
+    r"^wget\s+([^|]+)$",
+    lambda m: f"Invoke-WebRequest -Uri '{m.group(1).strip()}' -OutFile './download'",
+)
+_rule(
+    r"^ping\s+-c\s+(\d+)\s+(\S+)$",
+    lambda m: f"Test-Connection -ComputerName '{m.group(2)}' -Count {m.group(1)}",
+)
 _rule(r"^ping\s+(\S+)$", lambda m: f"Test-Connection -ComputerName '{m.group(1)}'")
 _rule(r"^nslookup\s+(\S+)$", lambda m: f"Resolve-DnsName '{m.group(1)}'")
 _rule(r"^host\s+(\S+)$", lambda m: f"Resolve-DnsName '{m.group(1)}'")
@@ -206,19 +236,30 @@ _rule(r"^ss\s+-[a-z]+$", "Get-NetTCPConnection | Where-Object { $_.State -eq 'Li
 
 # ── text processing ───────────────────────────────────────────────────────────
 _rule(r"^wc\s+-l\s+([^|]+)$", lambda m: f"(Get-Content '{m.group(1).strip()}').Count")
-_rule(r"^wc\s+-w\s+([^|]+)$", lambda m: f"((Get-Content '{m.group(1).strip()}') -split '\\s+').Count")
+_rule(
+    r"^wc\s+-w\s+([^|]+)$", lambda m: f"((Get-Content '{m.group(1).strip()}') -split '\\s+').Count"
+)
 _rule(r"^wc\s+-c\s+([^|]+)$", lambda m: f"(Get-Item '{m.group(1).strip()}').Length")
 _rule(r"\|\s*wc\s+-l\s*$", "| Measure-Object -Line")
 _rule(r"\|\s*wc\s*$", "| Measure-Object -Line")
 _rule(
-    r"^head\s+-n\s+(\d+)\s+([^|]+)$", lambda m: f"Get-Content '{m.group(2).strip()}' -TotalCount {m.group(1)}"
+    r"^head\s+-n\s+(\d+)\s+([^|]+)$",
+    lambda m: f"Get-Content '{m.group(2).strip()}' -TotalCount {m.group(1)}",
 )
 _rule(r"^head\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}' -TotalCount 10")
-_rule(r"^tail\s+-n\s+(\d+)\s+([^|]+)$", lambda m: f"Get-Content '{m.group(2).strip()}' -Tail {m.group(1)}")
+_rule(
+    r"^tail\s+-n\s+(\d+)\s+([^|]+)$",
+    lambda m: f"Get-Content '{m.group(2).strip()}' -Tail {m.group(1)}",
+)
 _rule(r"^tail\s+-f\s+([^|]+)$", lambda m: f"Get-Content -Wait '{m.group(1).strip()}'")
 _rule(r"^tail\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}' -Tail 10")
-_rule(r"^sort\s+-u\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}' | Sort-Object -Unique")
-_rule(r"^sort\s+-r\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}' | Sort-Object -Descending")
+_rule(
+    r"^sort\s+-u\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}' | Sort-Object -Unique"
+)
+_rule(
+    r"^sort\s+-r\s+([^|]+)$",
+    lambda m: f"Get-Content '{m.group(1).strip()}' | Sort-Object -Descending",
+)
 _rule(r"^sort\s+([^|]+)$", lambda m: f"Get-Content '{m.group(1).strip()}' | Sort-Object")
 _rule(r"\|\s*sort\s+-u\s*$", "| Sort-Object -Unique")
 _rule(r"\|\s*sort\s+-r\s*$", "| Sort-Object -Descending")
@@ -292,7 +333,9 @@ _rule(
     r"^du\s+-sh\s+([^|]+)$",
     lambda m: f"(Get-ChildItem -Recurse '{m.group(1).strip()}' | Measure-Object -Property Length -Sum).Sum / 1MB",
 )
-_rule(r"^du\s+-sh\s*\.$", "(Get-ChildItem -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB")
+_rule(
+    r"^du\s+-sh\s*\.$", "(Get-ChildItem -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB"
+)
 _rule(r"^uname\s+-a$", "Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion")
 _rule(r"^uname\s+-r$", "(Get-CimInstance Win32_OperatingSystem).Version")
 _rule(r"^uname\s+-m$", "$env:PROCESSOR_ARCHITECTURE")
@@ -309,7 +352,7 @@ _rule(r"^history\s*$", "Get-History")
 # ── permissions ───────────────────────────────────────────────────────────────
 _rule(
     r"^chmod\s+\+x\s+(.+)$",
-    lambda m: f"# chmod +x not needed in PowerShell — rename to '{m.group(1).strip().replace('.sh','.ps1')}' or use Set-ExecutionPolicy",
+    lambda m: f"# chmod +x not needed in PowerShell — rename to '{m.group(1).strip().replace('.sh', '.ps1')}' or use Set-ExecutionPolicy",
 )
 _rule(
     r"^chmod\s+[0-7]{{3}}\s+(.+)$",

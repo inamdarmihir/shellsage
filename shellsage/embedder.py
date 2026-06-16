@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-MODEL_NAME = "all-MiniLM-L6-v2"  # 22 MB, runs on CPU, 384-dim
+from shellsage.config import EMBED_MODEL
+
+MODEL_NAME = EMBED_MODEL  # default: all-MiniLM-L6-v2, 384-dim, CPU-friendly
 
 
 @lru_cache(maxsize=1)

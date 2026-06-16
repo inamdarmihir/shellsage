@@ -34,7 +34,7 @@ class ShellContext:
     project_root: str
 
     @classmethod
-    def detect(cls, project_root: str = ".") -> "ShellContext":
+    def detect(cls, project_root: str = ".") -> ShellContext:
         """Auto-detect the current runtime environment."""
         os_name = _detect_os()
         shell, shell_version = _detect_shell()

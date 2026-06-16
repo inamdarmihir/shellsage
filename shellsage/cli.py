@@ -7,9 +7,18 @@ import sys
 
 import click
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 
-from shellsage.config import QDRANT_URL as _DEFAULT_URL, SEED_CONFIDENCE
+from shellsage.config import DEFAULT_SEED_LIMIT, SEED_CONFIDENCE
+from shellsage.config import QDRANT_URL as _DEFAULT_URL
 
 console = Console()
 
@@ -21,16 +30,56 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
-def init(qdrant_url: str) -> None:
-    """Initialise Qdrant collections and load seed translations."""
-    from shellsage import embedder, store
-    from shellsage.seed import SEED_TRANSLATIONS
+@click.option(
+    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=DEFAULT_SEED_LIMIT,
+    show_default=True,
+    envvar="SHELLSAGE_SEED_LIMIT",
+    help="Maximum number of curated seed examples to load.",
+)
+@click.option("--all", "load_all", is_flag=True, help="Load the complete seed corpus.")
+@click.option(
+    "--batch-size",
+    type=click.IntRange(min=1),
+    default=16,
+    show_default=True,
+    help="Embedding batch size.",
+)
+def init(qdrant_url: str, limit: int, load_all: bool, batch_size: int) -> None:
+    """Initialise Qdrant collections and load a bounded seed set."""
+    try:
+        from shellsage import embedder, store
+    except (ImportError, ModuleNotFoundError) as exc:
+        console.print("[red]Vector dependencies are not installed.[/red]")
+        console.print("Install them with:  [dim]pip install 'shellsage[vector]'[/dim]")
+        console.print(f"[dim]{exc}[/dim]")
+        sys.exit(1)
+
+    from shellsage.seed import SEED_TRANSLATIONS, select_seed_translations
+
+    seeds = select_seed_translations(None if load_all else limit)
 
     console.print("[bold cyan]ShellSage init[/bold cyan]")
+    console.print(
+        f"Loading [bold]{len(seeds)}[/bold] seed examples "
+        f"([dim]{len(SEED_TRANSLATIONS)} available; use --all for the full set[/dim])"
+    )
 
-    # 1. Ensure collections exist
-    with console.status("Creating Qdrant collections…"):
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    )
+
+    with progress:
+        collections_task = progress.add_task("Preparing Qdrant collections", total=1)
         try:
             store.ensure_collections(url=qdrant_url)
         except Exception as exc:
@@ -38,14 +87,19 @@ def init(qdrant_url: str) -> None:
             console.print(f"  {exc}")
             console.print("\nStart Qdrant with:  docker compose up -d")
             sys.exit(1)
-    console.print("  [green]✓[/green] Collections ready")
+        progress.advance(collections_task)
 
-    # 2. Load seed translations
-    with console.status(f"Embedding {len(SEED_TRANSLATIONS)} seed translations…"):
-        bash_cmds = [s["bash"] for s in SEED_TRANSLATIONS]
-        vectors = embedder.embed_batch(bash_cmds)
+        embed_task = progress.add_task("Embedding seed examples", total=len(seeds))
+        vectors: list[list[float]] = []
+        for start in range(0, len(seeds), batch_size):
+            batch = seeds[start : start + batch_size]
+            vectors.extend(embedder.embed_batch([s["bash"] for s in batch]))
+            progress.advance(embed_task, len(batch))
+
+        upsert_task = progress.add_task("Writing seed examples", total=len(seeds))
         loaded = 0
-        for seed, vec in zip(SEED_TRANSLATIONS, vectors, strict=False):
+        failed = 0
+        for seed, vec in zip(seeds, vectors, strict=False):
             try:
                 store.upsert_translation(
                     bash_cmd=seed["bash"],
@@ -59,8 +113,13 @@ def init(qdrant_url: str) -> None:
                 )
                 loaded += 1
             except Exception:
-                pass
-    console.print(f"  [green]✓[/green] {loaded}/{len(SEED_TRANSLATIONS)} seed translations loaded")
+                failed += 1
+            finally:
+                progress.advance(upsert_task)
+
+    console.print(f"  [green]✓[/green] {loaded}/{len(seeds)} seed translations loaded")
+    if failed:
+        console.print(f"  [yellow]![/yellow] {failed} seed translations failed to load")
 
     console.print("\n[bold green]Ready.[/bold green]  Register with Claude Code:")
     console.print("  [dim]claude mcp add shellsage -- shellsage mcp[/dim]")
@@ -70,7 +129,9 @@ def init(qdrant_url: str) -> None:
 @main.command()
 @click.argument("command")
 @click.option("--project-root", default=".", show_default=True)
-@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
+@click.option(
+    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
+)
 @click.option("--json-out", is_flag=True, default=False)
 def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) -> None:
     """Translate a single command and print the result."""
@@ -82,13 +143,15 @@ def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) 
 
     if json_out:
         click.echo(
-            json.dumps({
-                "original": result.original,
-                "translated": result.translated,
-                "changed": result.was_changed,
-                "confidence": round(result.confidence, 3),
-                "source": result.source,
-            })
+            json.dumps(
+                {
+                    "original": result.original,
+                    "translated": result.translated,
+                    "changed": result.was_changed,
+                    "confidence": round(result.confidence, 3),
+                    "source": result.source,
+                }
+            )
         )
         return
 
@@ -101,13 +164,19 @@ def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) 
 
 
 @main.command()
-@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
+@click.option(
+    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
+)
 def stats(qdrant_url: str) -> None:
     """Show Qdrant collection counts."""
-    from shellsage import store
-
     try:
+        from shellsage import store
+
         counts = store.get_collection_counts(url=qdrant_url)
+    except (ImportError, ModuleNotFoundError):
+        console.print("[red]Vector dependencies are not installed.[/red]")
+        console.print("Install them with:  [dim]pip install 'shellsage[vector]'[/dim]")
+        sys.exit(1)
     except Exception as exc:
         console.print(f"[red]Qdrant unreachable:[/red] {exc}")
         sys.exit(1)
@@ -121,21 +190,27 @@ def stats(qdrant_url: str) -> None:
 
 
 @main.command()
-@click.option("--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL")
+@click.option(
+    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
+)
 @click.option("--limit", default=20, show_default=True)
 def replay(qdrant_url: str, limit: int) -> None:
     """Show recent failure patterns stored in Qdrant."""
-    from qdrant_client import QdrantClient
-
-    from shellsage.store import FAILURES_COLLECTION
-
     try:
+        from qdrant_client import QdrantClient
+
+        from shellsage.store import FAILURES_COLLECTION
+
         client = QdrantClient(url=qdrant_url, timeout=5)
         points, _ = client.scroll(
             collection_name=FAILURES_COLLECTION,
             limit=limit,
             with_payload=True,
         )
+    except (ImportError, ModuleNotFoundError):
+        console.print("[red]Vector dependencies are not installed.[/red]")
+        console.print("Install them with:  [dim]pip install 'shellsage[vector]'[/dim]")
+        sys.exit(1)
     except Exception as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)

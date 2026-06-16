@@ -1,4 +1,4 @@
-"""ShellSage — shell command translation layer backed by local Qdrant."""
+"""ShellSage — shell command translation layer for AI coding agents."""
 
 __version__ = "0.2.0"
 __all__ = ["translate", "store_outcome", "ShellContext"]

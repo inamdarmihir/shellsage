@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse hook — translates bash commands before Claude Code executes them."""
+"""PreToolUse hook � translates bash commands before Claude Code executes them."""
 import json
 import os
 import sys
@@ -20,7 +20,6 @@ try:
     ctx = ShellContext.detect()
     result = translate(command, ctx)
     if result.was_changed:
-        # Persist the original→translated mapping so post_tool_use can read it
         cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
         try:
             with open(cache_path, "w") as fh:
@@ -29,15 +28,13 @@ try:
             pass
 
         event["tool_input"]["command"] = result.translated
-        print(
-            json.dumps({
-                "decision": "approve",
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "updatedInput": event["tool_input"],
-                },
-            })
-        )
+        print(json.dumps({
+            "decision": "approve",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "updatedInput": event["tool_input"],
+            },
+        }))
         sys.exit(0)
 except Exception:
     pass  # never block the agent

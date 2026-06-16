@@ -9,7 +9,7 @@
 </pre></div>
 
 <p align="center">
-  <strong>300+ translations · hybrid search (RRF) · MCP server · hooks · local-first · zero token waste</strong>
+  <strong>fast rule engine · optional vector memory · MCP server · hooks · local-first · zero token waste</strong>
 </p>
 
 <p align="center">
@@ -39,7 +39,7 @@
 
 ---
 
-ShellSage intercepts every Bash tool call made by your AI coding agent (Claude Code, GitHub Copilot, Cursor, Cline …) and silently rewrites bash syntax into correct PowerShell/CMD before the shell sees it. The corrected command is stored back into local Qdrant so the system learns from every session.
+ShellSage intercepts Bash-style tool calls made by your AI coding agent (Claude Code, VSCode/GitHub Copilot, Kiro, Cursor, Cline …) and silently rewrites bash syntax into correct PowerShell/CMD before the shell sees it. It works immediately with a local rule engine; optional Qdrant vector memory can learn from successful sessions.
 
 **No API key. No cloud. Runs entirely on your machine.**
 
@@ -55,8 +55,8 @@ ShellSage intercepts every Bash tool call made by your AI coding agent (Claude C
 
 **How it translates:**
 
-1. **Qdrant hybrid search** — semantic embedding + BM25 lexical search fused via Reciprocal Rank Fusion (RRF). Finds the best match from 300+ seed translations plus everything learned in past sessions.
-2. **Rule-based fallback** — 100+ regex patterns covering all common bash constructs. Zero Qdrant dependency.
+1. **Rule-based translation** — 100+ regex patterns covering common bash constructs. Zero Qdrant dependency and fast on first run.
+2. **Optional Qdrant hybrid search** — semantic embedding + BM25 lexical search fused via Reciprocal Rank Fusion (RRF). Loads a bounded curated seed set by default and can learn from past sessions.
 3. **Passthrough** — if no translation is needed (bash on Linux/macOS, or git/docker commands that work everywhere), the command passes through unchanged.
 
 ---
@@ -64,23 +64,26 @@ ShellSage intercepts every Bash tool call made by your AI coding agent (Claude C
 ## Quickstart
 
 ```bash
-# 1. Start local Qdrant (no API key, no cloud)
-docker compose up -d
-
-# 2. Install
+# 1. Install the lightweight package
 pip install "shellsage[mcp]"
 
-# 3. Load 300+ seed translations into Qdrant
-shellsage init
-
-# 4. Register with Claude Code
+# 2. Register with Claude Code
 claude mcp add shellsage -- shellsage mcp
 
-# 5. Install hooks in your project
+# 3. Install hooks in your project
 shellsage hooks install
 ```
 
 That's it. ShellSage now intercepts every Bash call.
+
+Optional vector memory:
+
+```bash
+pip install "shellsage[vector]"
+docker compose up -d
+shellsage init          # loads a limited curated seed set with a progress bar
+shellsage init --all    # loads the complete seed corpus
+```
 
 ---
 
@@ -119,9 +122,9 @@ Add this to `.claude/settings.json`:
 
 **What each hook does:**
 - `pre_tool_use.py` — translates the command before execution; writes original→translated to a temp cache
-- `post_tool_use.py` — reads the cache, records success/failure back to Qdrant so the system learns
+- `post_tool_use.py` — reads the cache and records success/failure to Qdrant when vector memory is installed
 
-### GitHub Copilot / VSCode MCP
+### VSCode / GitHub Copilot / Kiro / Claude Code MCP
 
 Add to your MCP settings (e.g. `cline_mcp_settings.json` or cursor MCP panel):
 
@@ -148,7 +151,7 @@ export SHELLSAGE_QDRANT_URL=http://my-qdrant-host:6333
 
 ## Command Translation Reference
 
-Every entry below is loaded into Qdrant on `shellsage init`. The hybrid search finds the best match for any command the LLM writes — including variations with different paths, flags, and arguments.
+The rule engine handles these commands immediately. If vector memory is installed, `shellsage init` loads a limited curated seed set by default; use `shellsage init --all` to load the complete corpus.
 
 ### File Listing
 
@@ -392,6 +395,7 @@ All settings can be overridden via environment variables:
 | `SHELLSAGE_QDRANT_URL` | `http://localhost:6333` | Qdrant server URL |
 | `SHELLSAGE_SCORE_THRESHOLD` | `0.82` | Minimum cosine similarity to accept a Qdrant hit |
 | `SHELLSAGE_EMBED_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformer model (384-dim, ~22 MB) |
+| `SHELLSAGE_SEED_LIMIT` | `75` | Number of seed examples loaded by default |
 | `SHELLSAGE_SEED_CONFIDENCE` | `0.95` | Confidence assigned to seed translations |
 | `SHELLSAGE_OUTCOME_CONFIDENCE` | `0.99` | Confidence assigned when a command succeeds in practice |
 
@@ -412,7 +416,7 @@ The MCP server exposes 4 tools that your AI agent can call directly:
 | Tool | Description |
 |---|---|
 | `translate_command(command, project_root)` | Translate a bash command for the current shell |
-| `store_command_result(original, translated, shell, os_name, project_type, exit_code, error_snippet)` | Record command outcome back to Qdrant |
+| `store_command_result(original, translated, shell, os_name, project_type, exit_code, error_snippet)` | Record command outcome when vector memory is installed |
 | `get_shell_context(project_root)` | Return detected OS/shell/project environment |
 | `get_stats()` | Health check — return Qdrant collection counts |
 
@@ -421,7 +425,8 @@ The MCP server exposes 4 tools that your AI agent can call directly:
 ## CLI Reference
 
 ```
-shellsage init                       # Create collections + load 300+ seed translations
+shellsage init                       # Create collections + load a limited seed set
+shellsage init --all                 # Load the complete seed corpus
 shellsage translate "ls -la"         # Translate a single command (--json-out for JSON)
 shellsage stats                      # Show Qdrant collection counts
 shellsage replay                     # Show recent failure patterns
@@ -438,17 +443,17 @@ Options available on most commands:
 ## Architecture
 
 ```
- Claude Code / Copilot / Cursor
+ Claude Code / VSCode Copilot / Kiro / Cursor
          │  bash command
          ▼
  ┌───────────────────────────────────────────────┐
  │  PreToolUse Hook  (.claude/hooks/pre_*.py)    │
  │  ─────────────────────────────────────────    │
- │  1. Qdrant hybrid search                      │
- │     ├─ Dense: all-MiniLM-L6-v2 embeddings     │
- │     └─ Lexical: BM25 over stored commands     │
+ │  1. Rule-based translation (100+ patterns)     │
+ │  2. Optional Qdrant hybrid search              │
+ │     ├─ Dense: all-MiniLM-L6-v2 embeddings      │
+ │     └─ Lexical: BM25 over stored commands      │
  │     └─ Fused via Reciprocal Rank Fusion (RRF)  │
- │  2. Rule-based fallback  (100+ patterns)       │
  │  3. Passthrough                               │
  │  Writes cache: original → translated          │
  └───────────────────────────────────────────────┘
@@ -459,14 +464,14 @@ Options available on most commands:
          ▼
  ┌───────────────────────────────────────────────┐
  │  PostToolUse Hook (.claude/hooks/post_*.py)   │
- │  Reads cache, stores outcome → Qdrant         │
+ │  Reads cache, stores outcome when available    │
  │  Success → upsert translation (confidence=0.99)│
  │  Failure → upsert failure pattern             │
  └───────────────────────────────────────────────┘
          │
          ▼
-   Qdrant (local, http://localhost:6333)
-   ├─ shell_translations  (300+ entries + learned)
+   Optional Qdrant (local, http://localhost:6333)
+   ├─ shell_translations  (bounded seeds + learned)
    ├─ shell_failures      (error patterns)
    └─ shell_project_context
 ```
@@ -478,10 +483,10 @@ Options available on most commands:
 | `config.py` | Env-var-backed settings (single source of truth) |
 | `models.py` | `ShellContext`, `Translation`, `CommandOutcome` — zero deps |
 | `rules.py` | 100+ regex patterns (cold-start, no Qdrant needed) |
-| `seed.py` | 300+ curated bash→PS translations loaded at init |
+| `seed.py` | Curated bash→PS translations; `init` loads a bounded set by default |
 | `embedder.py` | Lazy `all-MiniLM-L6-v2` (384-dim, 22 MB, CPU) |
 | `store.py` | Qdrant: 3 collections, hybrid search (BM25 + cosine + RRF) |
-| `translator.py` | 3-tier resolution: Qdrant → rules → passthrough |
+| `translator.py` | 3-tier resolution: rules → optional Qdrant → passthrough |
 | `server.py` | FastMCP server (4 tools) |
 | `cli.py` | Click CLI (6 commands) |
 
