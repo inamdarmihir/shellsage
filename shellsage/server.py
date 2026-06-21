@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import os
-
+from shellsage.config import DB_PATH as _DEFAULT_DB
+from shellsage.config import SERVER_HOST, SERVER_PORT
 from shellsage.models import OS, CommandOutcome, Shell, ShellContext, Translation
 from shellsage.translator import store_outcome, translate
 
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore
 except ImportError as e:
-    raise ImportError("MCP support requires the 'mcp' extra: pip install 'shellsage[mcp]'") from e
+    raise ImportError(
+        "MCP support requires the 'mcp' extra: pip install 'shellsage[mcp]'"
+    ) from e
 
 mcp = FastMCP("shellsage")
-
-_QDRANT_URL = os.environ.get("SHELLSAGE_QDRANT_URL", "http://localhost:6333")
 
 
 @mcp.tool()
@@ -26,7 +26,7 @@ def translate_command(command: str, project_root: str = ".") -> dict:
     Call this from a PreToolUse hook before executing any bash command.
     """
     ctx = ShellContext.detect(project_root=project_root)
-    result: Translation = translate(command, ctx, qdrant_url=_QDRANT_URL)
+    result: Translation = translate(command, ctx)
     return {
         "original": result.original,
         "translated": result.translated,
@@ -49,7 +49,7 @@ def store_command_result(
     error_snippet: str = "",
 ) -> dict:
     """
-    Persist the outcome of a command execution back to Qdrant.
+    Persist the outcome of a command execution back to local memory.
 
     Call this from a PostToolUse hook after every bash command runs.
     Successes reinforce translation mappings; failures enrich failure patterns.
@@ -63,7 +63,7 @@ def store_command_result(
         exit_code=exit_code,
         error_snippet=error_snippet[:300],
     )
-    stored = store_outcome(outcome, qdrant_url=_QDRANT_URL)
+    stored = store_outcome(outcome)
     return {"stored": stored, "succeeded": outcome.succeeded}
 
 
@@ -82,18 +82,43 @@ def get_shell_context(project_root: str = ".") -> dict:
 
 @mcp.tool()
 def get_stats() -> dict:
-    """Return collection sizes from local Qdrant — useful for health checks."""
+    """Return collection sizes from local memory — useful for health checks."""
     try:
         from shellsage import store
 
-        counts = store.get_collection_counts(url=_QDRANT_URL)
-        return {"status": "ok", "collections": counts}
+        counts = store.get_stats()
+        return {"status": "ok", "db": _DEFAULT_DB, "counts": counts}
     except Exception as exc:
         return {"status": "error", "detail": str(exc)}
 
 
-def run() -> None:
-    mcp.run()
+def run(transport: str = "stdio", port: int = SERVER_PORT, host: str = SERVER_HOST) -> None:
+    if transport == "http":
+        _run_http(host, port)
+    else:
+        mcp.run()
+
+
+def _run_http(host: str, port: int) -> None:
+    try:
+        import uvicorn  # type: ignore[import-untyped]
+    except ImportError:
+        raise ImportError(
+            "HTTP mode requires uvicorn: pip install 'shellsage[mcp]'"
+        ) from None
+
+    # FastMCP exposes an ASGI app; try the newer API first then fall back.
+    try:
+        app = mcp.streamable_http_app()  # type: ignore[attr-defined]
+    except AttributeError:
+        try:
+            app = mcp.sse_app()  # type: ignore[attr-defined]
+        except AttributeError:
+            # Last resort: let FastMCP handle it via run() kwargs
+            mcp.run(transport="sse")  # type: ignore[call-arg]
+            return
+
+    uvicorn.run(app, host=host, port=port, log_level="error")
 
 
 if __name__ == "__main__":

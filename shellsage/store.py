@@ -1,38 +1,109 @@
-"""Qdrant store — three collections, local-first, no API key needed."""
+"""SQLite-backed store — zero external dependencies, BM25 text search built-in."""
 
 from __future__ import annotations
 
 import hashlib
 import math
 import re
-import uuid
+import sqlite3
+from pathlib import Path
 
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qm
-
-TRANSLATIONS_COLLECTION = "shell_translations"
-FAILURES_COLLECTION = "shell_failures"
-CONTEXT_COLLECTION = "shell_project_context"
-
-VECTOR_SIZE = 384  # all-MiniLM-L6-v2
-DISTANCE = qm.Distance.COSINE
+from shellsage.config import DB_PATH as _DEFAULT_DB
 
 
-def _client(url: str = "http://localhost:6333") -> QdrantClient:
-    return QdrantClient(url=url, timeout=5)
+# ── connection ────────────────────────────────────────────────────────────────
 
 
-def ensure_collections(url: str = "http://localhost:6333") -> None:
-    """Create all three collections if they don't already exist."""
-    client = _client(url)
-    existing = {c.name for c in client.get_collections().collections}
+def _connect(db_path: str | None = None) -> sqlite3.Connection:
+    path = db_path or _DEFAULT_DB
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
 
-    for name in (TRANSLATIONS_COLLECTION, FAILURES_COLLECTION, CONTEXT_COLLECTION):
-        if name not in existing:
-            client.create_collection(
-                collection_name=name,
-                vectors_config=qm.VectorParams(size=VECTOR_SIZE, distance=DISTANCE),
-            )
+
+# ── schema ────────────────────────────────────────────────────────────────────
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS translations (
+    id          TEXT PRIMARY KEY,
+    bash_cmd    TEXT NOT NULL,
+    translated_cmd TEXT NOT NULL,
+    shell       TEXT NOT NULL DEFAULT 'powershell',
+    os_name     TEXT NOT NULL DEFAULT 'windows',
+    project_type TEXT NOT NULL DEFAULT 'unknown',
+    confidence  REAL NOT NULL DEFAULT 0.9,
+    hits        INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trl_os_shell ON translations(os_name, shell);
+
+CREATE TABLE IF NOT EXISTS failures (
+    id          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+    command     TEXT NOT NULL,
+    error_text  TEXT NOT NULL DEFAULT '',
+    shell       TEXT NOT NULL,
+    os_name     TEXT NOT NULL,
+    project_type TEXT NOT NULL DEFAULT 'unknown',
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+"""
+
+_FTS5_CREATE = """
+CREATE VIRTUAL TABLE IF NOT EXISTS translations_fts USING fts5(
+    bash_cmd,
+    content=translations,
+    content_rowid=rowid
+)
+"""
+
+# Triggers must be executed individually — they contain embedded `;` inside BEGIN…END.
+_FTS5_TRIGGERS = [
+    """CREATE TRIGGER IF NOT EXISTS trl_ai AFTER INSERT ON translations BEGIN
+    INSERT INTO translations_fts(rowid, bash_cmd) VALUES (new.rowid, new.bash_cmd);
+END""",
+    """CREATE TRIGGER IF NOT EXISTS trl_au AFTER UPDATE ON translations BEGIN
+    INSERT INTO translations_fts(translations_fts, rowid, bash_cmd)
+        VALUES('delete', old.rowid, old.bash_cmd);
+    INSERT INTO translations_fts(rowid, bash_cmd) VALUES (new.rowid, new.bash_cmd);
+END""",
+    """CREATE TRIGGER IF NOT EXISTS trl_ad AFTER DELETE ON translations BEGIN
+    INSERT INTO translations_fts(translations_fts, rowid, bash_cmd)
+        VALUES('delete', old.rowid, old.bash_cmd);
+END""",
+]
+
+
+def ensure_tables(db_path: str | None = None) -> bool:
+    """Create schema. Returns True if FTS5 is available."""
+    conn = _connect(db_path)
+    with conn:
+        for stmt in _DDL.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                conn.execute(stmt)
+
+    has_fts5 = _setup_fts5(conn)
+    conn.close()
+    return has_fts5
+
+
+def _setup_fts5(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute(_FTS5_CREATE)
+        for trigger in _FTS5_TRIGGERS:
+            conn.execute(trigger)
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
 
 
 # ── translations ──────────────────────────────────────────────────────────────
@@ -46,187 +117,125 @@ def upsert_translation(
     os_name: str,
     project_type: str,
     confidence: float,
-    embedding: list[float],
-    url: str = "http://localhost:6333",
+    db_path: str | None = None,
 ) -> None:
-    """Store or overwrite a bash→target mapping."""
-    client = _client(url)
-    point_id = _stable_id(bash_cmd + shell + os_name)
-    client.upsert(
-        collection_name=TRANSLATIONS_COLLECTION,
-        points=[
-            qm.PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
-                    "bash_cmd": bash_cmd,
-                    "translated_cmd": translated_cmd,
-                    "shell": shell,
-                    "os": os_name,
-                    "project_type": project_type,
-                    "confidence": confidence,
-                    "hits": 1,
-                },
-            )
-        ],
-    )
-
-
-def _tokenize(text: str) -> list[str]:
-    return re.findall(r"\w+", text.lower())
-
-
-def _compute_bm25_scores(
-    query: str,
-    documents: list[dict],
-    k1: float = 1.5,
-    b: float = 0.75,
-) -> list[tuple[dict, float]]:
-    query_tokens = _tokenize(query)
-    if not query_tokens:
-        return [(doc, 0.0) for doc in documents]
-
-    # Tokenize all documents
-    doc_tokens_list = [_tokenize(doc.get("bash_cmd", "")) for doc in documents]
-    doc_lengths = [len(tokens) for tokens in doc_tokens_list]
-    avg_doc_len = sum(doc_lengths) / len(doc_lengths) if doc_lengths else 1.0
-
-    # Calculate document frequencies
-    doc_freqs: dict[str, int] = {}
-    for tokens in doc_tokens_list:
-        unique_tokens = set(tokens)
-        for token in unique_tokens:
-            doc_freqs[token] = doc_freqs.get(token, 0) + 1
-
-    N = len(documents)
-    scored_candidates = []
-    for doc, tokens, doc_len in zip(documents, doc_tokens_list, doc_lengths, strict=False):
-        score = 0.0
-        # Term frequencies in this document
-        tf: dict[str, int] = {}
-        for token in tokens:
-            tf[token] = tf.get(token, 0) + 1
-
-        for q in query_tokens:
-            n_q = doc_freqs.get(q, 0)
-            # IDF calculation
-            idf = math.log((N - n_q + 0.5) / (n_q + 0.5) + 1.0)
-            if idf < 0:
-                idf = 0.0
-
-            f_q = tf.get(q, 0)
-            denom = f_q + k1 * (1.0 - b + b * (doc_len / avg_doc_len))
-            if denom > 0:
-                score += idf * (f_q * (k1 + 1.0)) / denom
-
-        doc_copy = doc.copy()
-        doc_copy["score"] = score
-        scored_candidates.append((doc_copy, score))
-
-    scored_candidates.sort(key=lambda x: x[1], reverse=True)
-    return scored_candidates
-
-
-def _reciprocal_rank_fusion(
-    semantic_results: list[dict],
-    lexical_results: list[dict],
-    k: int = 60,
-    limit: int = 3,
-) -> list[dict]:
-    candidates = {}
-
-    # Ranks in semantic
-    semantic_ranks = {}
-    for idx, item in enumerate(semantic_results):
-        cmd = item["bash_cmd"]
-        semantic_ranks[cmd] = idx + 1
-        if cmd not in candidates:
-            candidates[cmd] = item
-
-    # Ranks in lexical
-    lexical_ranks = {}
-    for idx, item in enumerate(lexical_results):
-        cmd = item["bash_cmd"]
-        lexical_ranks[cmd] = idx + 1
-        if cmd not in candidates:
-            candidates[cmd] = item
-
-    # Calculate RRF score for each unique bash_cmd
-    rrf_scores = {}
-    for cmd in candidates:
-        r_sem = semantic_ranks.get(cmd, 10000)
-        r_lex = lexical_ranks.get(cmd, 10000)
-        rrf_scores[cmd] = (1.0 / (k + r_sem)) + (1.0 / (k + r_lex))
-
-    # Sort candidates by RRF score descending
-    sorted_cmds = sorted(rrf_scores.keys(), key=lambda c: rrf_scores[c], reverse=True)
-
-    results = []
-    for cmd in sorted_cmds[:limit]:
-        item = candidates[cmd].copy()
-        if cmd not in semantic_ranks:
-            item["score"] = max(0.85, item.get("score", 0.0))
-        results.append(item)
-
-    return results
+    row_id = _stable_id(bash_cmd + shell + os_name)
+    conn = _connect(db_path)
+    with conn:
+        existing = conn.execute(
+            "SELECT hits FROM translations WHERE id = ?", (row_id,)
+        ).fetchone()
+        hits = (existing["hits"] + 1) if existing else 1
+        conn.execute(
+            """
+            INSERT INTO translations(id, bash_cmd, translated_cmd, shell, os_name, project_type, confidence, hits)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                translated_cmd = excluded.translated_cmd,
+                confidence     = excluded.confidence,
+                hits           = excluded.hits
+            """,
+            (row_id, bash_cmd, translated_cmd, shell, os_name, project_type, confidence, hits),
+        )
+    conn.close()
 
 
 def query_translation(
     *,
-    bash_cmd: str | None = None,
-    embedding: list[float],
+    bash_cmd: str,
     shell: str,
     os_name: str,
-    project_type: str,
+    project_type: str = "unknown",  # noqa: ARG001 — kept for API compat
     limit: int = 3,
-    score_threshold: float = 0.82,
-    url: str = "http://localhost:6333",
+    score_threshold: float = 0.1,
+    db_path: str | None = None,
 ) -> list[dict]:
-    """Search for matching translations using hybrid search (semantic + lexical fused via RRF)."""
-    client = _client(url)
-    must_filters = [
-        qm.FieldCondition(key="shell", match=qm.MatchValue(value=shell)),
-        qm.FieldCondition(key="os", match=qm.MatchValue(value=os_name)),
+    conn = _connect(db_path)
+
+    # Always fetch rows for the Python BM25 fallback (also used to check if DB is populated)
+    rows = conn.execute(
+        "SELECT bash_cmd, translated_cmd, confidence, hits FROM translations WHERE os_name=? AND shell=?",
+        (os_name, shell),
+    ).fetchall()
+
+    if not rows:
+        conn.close()
+        return []
+
+    # Try FTS5 first — only use its results if non-empty (FTS5 may exist but be un-synced)
+    fts_results = _query_fts5(conn, bash_cmd, shell, os_name, limit, score_threshold)
+    conn.close()
+    if fts_results:
+        return fts_results
+
+    # Python-side BM25 fallback
+    docs = [
+        {"bash_cmd": r["bash_cmd"], "translated_cmd": r["translated_cmd"],
+         "confidence": r["confidence"], "hits": r["hits"]}
+        for r in rows
     ]
+    scored = _bm25_scores(bash_cmd, docs)
+    results = []
+    max_score = scored[0][1] if scored else 1.0
+    for doc, score in scored:
+        if score <= 0:
+            break
+        norm = min(0.97, score / max(max_score, 1e-9))
+        if norm >= score_threshold:
+            results.append({**doc, "score": norm})
+    return results[:limit]
 
-    # 1. Semantic search
-    semantic_hits = []
+
+def _query_fts5(
+    conn: sqlite3.Connection,
+    bash_cmd: str,
+    shell: str,
+    os_name: str,
+    limit: int,
+    score_threshold: float,
+) -> list[dict] | None:
+    fts_query = _to_fts_query(bash_cmd)
+    if not fts_query:
+        return []
     try:
-        results = client.search(
-            collection_name=TRANSLATIONS_COLLECTION,
-            query_vector=embedding,
-            query_filter=qm.Filter(must=must_filters),
-            limit=limit * 3,
-            score_threshold=score_threshold,
-            with_payload=True,
-        )
-        semantic_hits = [{"score": r.score, **r.payload} for r in results]
-    except Exception:
-        pass
+        rows = conn.execute(
+            """
+            SELECT t.bash_cmd, t.translated_cmd, t.confidence, t.hits,
+                   -bm25(translations_fts) AS raw_score
+            FROM translations_fts fts
+            JOIN translations t ON fts.rowid = t.rowid
+            WHERE translations_fts MATCH ?
+              AND t.os_name = ?
+              AND t.shell   = ?
+            ORDER BY bm25(translations_fts)
+            LIMIT ?
+            """,
+            (fts_query, os_name, shell, limit * 3),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None  # FTS5 not available
 
-    if not bash_cmd:
-        return semantic_hits[:limit]
+    if not rows:
+        return []
 
-    # 2. Lexical search (BM25)
-    lexical_hits = []
-    try:
-        records, _ = client.scroll(
-            collection_name=TRANSLATIONS_COLLECTION,
-            scroll_filter=qm.Filter(must=must_filters),
-            limit=1000,
-            with_payload=True,
-            with_vectors=False,
-        )
-        candidates = [{"score": 0.0, **r.payload} for r in records]
-        if candidates:
-            scored_candidates = _compute_bm25_scores(bash_cmd, candidates)
-            scored_candidates = [item for item, score in scored_candidates if score > 0.0]
-            lexical_hits = scored_candidates
-    except Exception:
-        pass
+    max_score = rows[0]["raw_score"] if rows else 1.0
+    results = []
+    for row in rows:
+        norm = min(0.97, row["raw_score"] / max(max_score, 1e-9))
+        if norm >= score_threshold:
+            results.append({
+                "bash_cmd": row["bash_cmd"],
+                "translated_cmd": row["translated_cmd"],
+                "confidence": row["confidence"],
+                "hits": row["hits"],
+                "score": norm,
+            })
+    return results[:limit]
 
-    # 3. Reciprocal Rank Fusion (RRF)
-    return _reciprocal_rank_fusion(semantic_hits, lexical_hits, limit=limit)
+
+def _to_fts_query(cmd: str) -> str:
+    tokens = re.findall(r"\w+", cmd.lower())
+    return " ".join(tokens)
 
 
 # ── failures ──────────────────────────────────────────────────────────────────
@@ -239,92 +248,94 @@ def upsert_failure(
     shell: str,
     os_name: str,
     project_type: str,
-    embedding: list[float],
-    url: str = "http://localhost:6333",
+    db_path: str | None = None,
 ) -> None:
-    """Record a failed command for later clustering / analysis."""
-    client = _client(url)
-    client.upsert(
-        collection_name=FAILURES_COLLECTION,
-        points=[
-            qm.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=embedding,
-                payload={
-                    "command": command,
-                    "error_text": error_text[:300],
-                    "shell": shell,
-                    "os": os_name,
-                    "project_type": project_type,
-                },
-            )
-        ],
-    )
+    conn = _connect(db_path)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO failures(command, error_text, shell, os_name, project_type)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (command, error_text[:300], shell, os_name, project_type),
+        )
+    conn.close()
 
 
-def query_similar_failures(
+def get_recent_failures(
     *,
-    embedding: list[float],
-    shell: str,
-    limit: int = 5,
-    url: str = "http://localhost:6333",
+    shell: str | None = None,
+    limit: int = 20,
+    db_path: str | None = None,
 ) -> list[dict]:
-    client = _client(url)
-    results = client.search(
-        collection_name=FAILURES_COLLECTION,
-        query_vector=embedding,
-        query_filter=qm.Filter(
-            must=[qm.FieldCondition(key="shell", match=qm.MatchValue(value=shell))]
-        ),
-        limit=limit,
-        with_payload=True,
-    )
-    return [{"score": r.score, **r.payload} for r in results]
+    conn = _connect(db_path)
+    if shell:
+        rows = conn.execute(
+            "SELECT * FROM failures WHERE shell=? ORDER BY created_at DESC LIMIT ?",
+            (shell, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM failures ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
-# ── project context ───────────────────────────────────────────────────────────
+# ── stats ─────────────────────────────────────────────────────────────────────
 
 
-def upsert_project_context(
-    *,
-    project_root: str,
-    shell: str,
-    os_name: str,
-    project_type: str,
-    embedding: list[float],
-    url: str = "http://localhost:6333",
-) -> None:
-    client = _client(url)
-    point_id = _stable_id(project_root)
-    client.upsert(
-        collection_name=CONTEXT_COLLECTION,
-        points=[
-            qm.PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
-                    "project_root": project_root,
-                    "shell": shell,
-                    "os": os_name,
-                    "project_type": project_type,
-                },
-            )
-        ],
-    )
-
-
-def get_collection_counts(url: str = "http://localhost:6333") -> dict[str, int]:
-    client = _client(url)
-    return {
-        name: client.get_collection(name).points_count
-        for name in (TRANSLATIONS_COLLECTION, FAILURES_COLLECTION, CONTEXT_COLLECTION)
-    }
+def get_stats(db_path: str | None = None) -> dict[str, int]:
+    conn = _connect(db_path)
+    translations = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
+    failures = conn.execute("SELECT COUNT(*) FROM failures").fetchone()[0]
+    conn.close()
+    return {"translations": translations, "failures": failures}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _stable_id(text: str) -> str:
-    """Deterministic UUID from text so upserts are idempotent."""
-    digest = hashlib.md5(text.encode()).hexdigest()
-    return str(uuid.UUID(digest))
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def _bm25_scores(
+    query: str,
+    documents: list[dict],
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> list[tuple[dict, float]]:
+    query_tokens = re.findall(r"\w+", query.lower())
+    if not query_tokens:
+        return [(doc, 0.0) for doc in documents]
+
+    doc_tokens_list = [re.findall(r"\w+", doc.get("bash_cmd", "").lower()) for doc in documents]
+    doc_lengths = [len(t) for t in doc_tokens_list]
+    avg_len = sum(doc_lengths) / len(doc_lengths) if doc_lengths else 1.0
+
+    df: dict[str, int] = {}
+    for tokens in doc_tokens_list:
+        for tok in set(tokens):
+            df[tok] = df.get(tok, 0) + 1
+
+    N = len(documents)
+    results = []
+    for doc, tokens, doc_len in zip(documents, doc_tokens_list, doc_lengths, strict=False):
+        tf: dict[str, int] = {}
+        for tok in tokens:
+            tf[tok] = tf.get(tok, 0) + 1
+
+        score = 0.0
+        for q in query_tokens:
+            n_q = df.get(q, 0)
+            idf = math.log((N - n_q + 0.5) / (n_q + 0.5) + 1.0)
+            f_q = tf.get(q, 0)
+            denom = f_q + k1 * (1.0 - b + b * (doc_len / avg_len))
+            if denom > 0:
+                score += max(0.0, idf) * (f_q * (k1 + 1.0)) / denom
+
+        results.append((doc, score))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results

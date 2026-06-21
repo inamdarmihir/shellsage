@@ -1,4 +1,4 @@
-"""ShellSage CLI — shellsage init | translate | stats | replay | mcp | hooks"""
+"""ShellSage CLI — shellsage setup | init | translate | stats | replay | mcp | start | stop | status | hooks"""
 
 from __future__ import annotations
 
@@ -7,18 +7,10 @@ import sys
 
 import click
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 from rich.table import Table
 
-from shellsage.config import DEFAULT_SEED_LIMIT, SEED_CONFIDENCE
-from shellsage.config import QDRANT_URL as _DEFAULT_URL
+from shellsage.config import DB_PATH as _DEFAULT_DB
+from shellsage.config import DEFAULT_SEED_LIMIT, SEED_CONFIDENCE, SERVER_HOST, SERVER_PORT
 
 console = Console()
 
@@ -26,39 +18,37 @@ console = Console()
 @click.group()
 @click.version_option(package_name="shellsage")
 def main() -> None:
-    """ShellSage — shell translation layer backed by local Qdrant."""
+    """ShellSage — shell translation layer with local SQLite memory."""
+
+
+# ── setup wizard ──────────────────────────────────────────────────────────────
 
 
 @main.command()
-@click.option(
-    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
-)
+@click.option("--port", default=SERVER_PORT, show_default=True, envvar="SHELLSAGE_PORT")
+@click.option("--host", default=SERVER_HOST, show_default=True, envvar="SHELLSAGE_HOST")
+def setup(port: int, host: str) -> None:
+    """Interactive one-command install wizard."""
+    from shellsage.setup_wizard import run_wizard
+    run_wizard(port=port, host=host)
+
+
+# ── init (seed the DB) ────────────────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--all", "load_all", is_flag=True, help="Load the complete seed corpus.")
 @click.option(
     "--limit",
     type=click.IntRange(min=1),
     default=DEFAULT_SEED_LIMIT,
     show_default=True,
     envvar="SHELLSAGE_SEED_LIMIT",
-    help="Maximum number of curated seed examples to load.",
 )
-@click.option("--all", "load_all", is_flag=True, help="Load the complete seed corpus.")
-@click.option(
-    "--batch-size",
-    type=click.IntRange(min=1),
-    default=16,
-    show_default=True,
-    help="Embedding batch size.",
-)
-def init(qdrant_url: str, limit: int, load_all: bool, batch_size: int) -> None:
-    """Initialise Qdrant collections and load a bounded seed set."""
-    try:
-        from shellsage import embedder, store
-    except (ImportError, ModuleNotFoundError) as exc:
-        console.print("[red]Vector dependencies are not installed.[/red]")
-        console.print("Install them with:  [dim]pip install 'shellsage[vector]'[/dim]")
-        console.print(f"[dim]{exc}[/dim]")
-        sys.exit(1)
-
+@click.option("--db-path", default=_DEFAULT_DB, show_default=True, envvar="SHELLSAGE_DB_PATH")
+def init(load_all: bool, limit: int, db_path: str) -> None:
+    """Initialise the local database and load seed translations."""
+    from shellsage import store
     from shellsage.seed import SEED_TRANSLATIONS, select_seed_translations
 
     seeds = select_seed_translations(None if load_all else limit)
@@ -66,80 +56,45 @@ def init(qdrant_url: str, limit: int, load_all: bool, batch_size: int) -> None:
     console.print("[bold cyan]ShellSage init[/bold cyan]")
     console.print(
         f"Loading [bold]{len(seeds)}[/bold] seed examples "
-        f"([dim]{len(SEED_TRANSLATIONS)} available; use --all for the full set[/dim])"
+        f"([dim]{len(SEED_TRANSLATIONS)} available; use --all for full set[/dim])"
     )
 
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
+    store.ensure_tables(db_path)
+    loaded = 0
+    for seed in seeds:
+        store.upsert_translation(
+            bash_cmd=seed["bash"],
+            translated_cmd=seed["ps"],
+            shell="powershell",
+            os_name="windows",
+            project_type="unknown",
+            confidence=SEED_CONFIDENCE,
+            db_path=db_path,
+        )
+        loaded += 1
 
-    with progress:
-        collections_task = progress.add_task("Preparing Qdrant collections", total=1)
-        try:
-            store.ensure_collections(url=qdrant_url)
-        except Exception as exc:
-            console.print(f"[red]✗ Qdrant unreachable at {qdrant_url}[/red]")
-            console.print(f"  {exc}")
-            console.print("\nStart Qdrant with:  docker compose up -d")
-            sys.exit(1)
-        progress.advance(collections_task)
+    counts = store.get_stats(db_path)
+    console.print(f"  [green]OK[/green] {loaded} translations loaded  "
+                  f"(total in DB: {counts['translations']})")
+    console.print(f"\n[bold green]Ready.[/bold green]  Run setup wizard:")
+    console.print("  [dim]shellsage setup[/dim]")
 
-        embed_task = progress.add_task("Embedding seed examples", total=len(seeds))
-        vectors: list[list[float]] = []
-        for start in range(0, len(seeds), batch_size):
-            batch = seeds[start : start + batch_size]
-            vectors.extend(embedder.embed_batch([s["bash"] for s in batch]))
-            progress.advance(embed_task, len(batch))
 
-        upsert_task = progress.add_task("Writing seed examples", total=len(seeds))
-        loaded = 0
-        failed = 0
-        for seed, vec in zip(seeds, vectors, strict=False):
-            try:
-                store.upsert_translation(
-                    bash_cmd=seed["bash"],
-                    translated_cmd=seed["ps"],
-                    shell="powershell",
-                    os_name="windows",
-                    project_type="unknown",
-                    confidence=SEED_CONFIDENCE,
-                    embedding=vec,
-                    url=qdrant_url,
-                )
-                loaded += 1
-            except Exception:
-                failed += 1
-            finally:
-                progress.advance(upsert_task)
-
-    console.print(f"  [green]✓[/green] {loaded}/{len(seeds)} seed translations loaded")
-    if failed:
-        console.print(f"  [yellow]![/yellow] {failed} seed translations failed to load")
-
-    console.print("\n[bold green]Ready.[/bold green]  Register with Claude Code:")
-    console.print("  [dim]claude mcp add shellsage -- shellsage mcp[/dim]")
-    console.print("\nInstall hooks:  shellsage hooks install")
+# ── translate (single command test) ──────────────────────────────────────────
 
 
 @main.command()
 @click.argument("command")
 @click.option("--project-root", default=".", show_default=True)
-@click.option(
-    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
-)
+@click.option("--db-path", default=_DEFAULT_DB, show_default=True, envvar="SHELLSAGE_DB_PATH")
 @click.option("--json-out", is_flag=True, default=False)
-def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) -> None:
+def translate(command: str, project_root: str, db_path: str, json_out: bool) -> None:
     """Translate a single command and print the result."""
     from shellsage.models import ShellContext
     from shellsage.translator import translate as _translate
 
     ctx = ShellContext.detect(project_root=project_root)
-    result = _translate(command, ctx, qdrant_url=qdrant_url)
+    result = _translate(command, ctx, db_path=db_path)
 
     if json_out:
         click.echo(
@@ -163,59 +118,45 @@ def translate(command: str, project_root: str, qdrant_url: str, json_out: bool) 
         console.print(f"[dim]no translation needed[/dim]  {result.translated}")
 
 
+# ── stats ─────────────────────────────────────────────────────────────────────
+
+
 @main.command()
-@click.option(
-    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
-)
-def stats(qdrant_url: str) -> None:
-    """Show Qdrant collection counts."""
+@click.option("--db-path", default=_DEFAULT_DB, show_default=True, envvar="SHELLSAGE_DB_PATH")
+def stats(db_path: str) -> None:
+    """Show local database counts."""
     try:
         from shellsage import store
-
-        counts = store.get_collection_counts(url=qdrant_url)
-    except (ImportError, ModuleNotFoundError):
-        console.print("[red]Vector dependencies are not installed.[/red]")
-        console.print("Install them with:  [dim]pip install 'shellsage[vector]'[/dim]")
-        sys.exit(1)
-    except Exception as exc:
-        console.print(f"[red]Qdrant unreachable:[/red] {exc}")
-        sys.exit(1)
-
-    table = Table(title="ShellSage — Qdrant Collections", show_header=True)
-    table.add_column("Collection", style="cyan")
-    table.add_column("Documents", justify="right", style="green")
-    for name, count in counts.items():
-        table.add_row(name, str(count))
-    console.print(table)
-
-
-@main.command()
-@click.option(
-    "--qdrant-url", default=_DEFAULT_URL, show_default=True, envvar="SHELLSAGE_QDRANT_URL"
-)
-@click.option("--limit", default=20, show_default=True)
-def replay(qdrant_url: str, limit: int) -> None:
-    """Show recent failure patterns stored in Qdrant."""
-    try:
-        from qdrant_client import QdrantClient
-
-        from shellsage.store import FAILURES_COLLECTION
-
-        client = QdrantClient(url=qdrant_url, timeout=5)
-        points, _ = client.scroll(
-            collection_name=FAILURES_COLLECTION,
-            limit=limit,
-            with_payload=True,
-        )
-    except (ImportError, ModuleNotFoundError):
-        console.print("[red]Vector dependencies are not installed.[/red]")
-        console.print("Install them with:  [dim]pip install 'shellsage[vector]'[/dim]")
-        sys.exit(1)
+        counts = store.get_stats(db_path)
     except Exception as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    if not points:
+    table = Table(title="ShellSage - Local Memory", show_header=True)
+    table.add_column("Table", style="cyan")
+    table.add_column("Rows", justify="right", style="green")
+    for name, count in counts.items():
+        table.add_row(name, str(count))
+    console.print(table)
+    console.print(f"[dim]DB: {db_path}[/dim]")
+
+
+# ── replay ────────────────────────────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--limit", default=20, show_default=True)
+@click.option("--db-path", default=_DEFAULT_DB, show_default=True, envvar="SHELLSAGE_DB_PATH")
+def replay(limit: int, db_path: str) -> None:
+    """Show recent failure patterns stored in local memory."""
+    try:
+        from shellsage import store
+        failures = store.get_recent_failures(limit=limit, db_path=db_path)
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    if not failures:
         console.print("[dim]No failures recorded yet.[/dim]")
         return
 
@@ -224,28 +165,115 @@ def replay(qdrant_url: str, limit: int) -> None:
     table.add_column("OS", style="cyan")
     table.add_column("Command", style="white")
     table.add_column("Error (truncated)", style="red")
+    table.add_column("When", style="dim")
 
-    for p in points:
-        pay = p.payload or {}
+    for f in failures:
         table.add_row(
-            pay.get("shell", "?"),
-            pay.get("os", "?"),
-            (pay.get("command") or "")[:50],
-            (pay.get("error_text") or "")[:60],
+            f.get("shell", "?"),
+            f.get("os_name", "?"),
+            (f.get("command") or "")[:50],
+            (f.get("error_text") or "")[:60],
+            (f.get("created_at") or "")[:16],
         )
     console.print(table)
 
 
+# ── MCP server ────────────────────────────────────────────────────────────────
+
+
 @main.command()
-def mcp() -> None:
-    """Start the MCP server (used by Claude Code and GitHub Copilot)."""
+@click.option("--http", "transport", flag_value="http", default=False,
+              help="Run as HTTP/SSE server instead of stdio.")
+@click.option("--port", default=SERVER_PORT, show_default=True, envvar="SHELLSAGE_PORT")
+@click.option("--host", default=SERVER_HOST, show_default=True, envvar="SHELLSAGE_HOST")
+def mcp(transport: str, port: int, host: str) -> None:
+    """Start the MCP server (stdio by default; use --http for background service)."""
     try:
         from shellsage.server import run
     except ImportError:
         console.print("[red]MCP extra not installed.[/red]")
         console.print("Run:  pip install 'shellsage[mcp]'")
         sys.exit(1)
-    run()
+    run(transport=transport or "stdio", port=port, host=host)
+
+
+# ── daemon: start / stop / status ────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--port", default=SERVER_PORT, show_default=True, envvar="SHELLSAGE_PORT")
+@click.option("--host", default=SERVER_HOST, show_default=True, envvar="SHELLSAGE_HOST")
+def start(port: int, host: str) -> None:
+    """Start the MCP server as a background daemon."""
+    from shellsage.daemon import start_daemon
+
+    result = start_daemon(port=port, host=host)
+    if result.get("started"):
+        console.print(
+            f"[green]>[/green] ShellSage daemon started  "
+            f"(PID {result['pid']} | http://{host}:{port}/sse)"
+        )
+        console.print(
+            f"\nRegister with Claude Code:\n"
+            f"  [dim]claude mcp add --transport sse shellsage http://{host}:{port}/sse[/dim]"
+        )
+    elif result.get("reason") == "already_running":
+        console.print(
+            f"[yellow]![/yellow] Already running  (PID {result.get('pid')})"
+        )
+    else:
+        console.print(f"[red]X[/red] Could not start daemon: {result}")
+        sys.exit(1)
+
+
+@main.command()
+def stop() -> None:
+    """Stop the background daemon."""
+    from shellsage.daemon import stop_daemon
+
+    result = stop_daemon()
+    if result.get("stopped"):
+        console.print(f"[green]>[/green] Daemon stopped  (was PID {result.get('pid')})")
+    elif result.get("reason") == "not_running":
+        console.print("[dim]Daemon is not running.[/dim]")
+    else:
+        console.print(f"[red]X[/red] Could not stop daemon: {result.get('reason')}")
+        sys.exit(1)
+
+
+@main.command()
+def status() -> None:
+    """Show daemon and database status."""
+    from shellsage.daemon import get_status, log_path
+
+    daemon_status = get_status()
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column()
+
+    if daemon_status["running"]:
+        table.add_row("Daemon", f"[green]running[/green]  (PID {daemon_status['pid']})")
+        table.add_row("MCP endpoint", f"http://{SERVER_HOST}:{SERVER_PORT}/sse")
+    else:
+        table.add_row("Daemon", "[red]stopped[/red]")
+        table.add_row("", "[dim]Run: shellsage start[/dim]")
+
+    try:
+        from shellsage import store
+        counts = store.get_stats()
+        table.add_row("Translations", str(counts["translations"]))
+        table.add_row("Failures", str(counts["failures"]))
+    except Exception:
+        table.add_row("DB", "[dim]not initialised - run: shellsage init[/dim]")
+
+    table.add_row("DB path", _DEFAULT_DB)
+    table.add_row("Log", str(log_path()))
+
+    console.print(table)
+
+
+# ── hooks ─────────────────────────────────────────────────────────────────────
 
 
 @main.group()
@@ -257,24 +285,24 @@ def hooks() -> None:
 @click.option("--hooks-dir", default=".claude", show_default=True)
 def hooks_install(hooks_dir: str) -> None:
     """Write PreToolUse and PostToolUse hook scripts into .claude/hooks/."""
-    import os
     import stat
+    from pathlib import Path
 
-    hooks_path = os.path.join(hooks_dir, "hooks")
-    os.makedirs(hooks_path, exist_ok=True)
+    hooks_path = Path(hooks_dir) / "hooks"
+    hooks_path.mkdir(parents=True, exist_ok=True)
 
-    pre = os.path.join(hooks_path, "pre_tool_use.py")
-    post = os.path.join(hooks_path, "post_tool_use.py")
+    pre = hooks_path / "pre_tool_use.py"
+    post = hooks_path / "post_tool_use.py"
 
-    _write_hook(pre, _PRE_TOOL_USE_SCRIPT)
-    _write_hook(post, _POST_TOOL_USE_SCRIPT)
+    pre.write_text(_PRE_TOOL_USE_SCRIPT)
+    post.write_text(_POST_TOOL_USE_SCRIPT)
 
-    for path in (pre, post):
-        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    for p in (pre, post):
+        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-    console.print(f"[green]✓[/green] Hooks written to [cyan]{hooks_path}[/cyan]")
+    console.print(f"[green]>[/green] Hooks written to [cyan]{hooks_path}[/cyan]")
     console.print("\nAdd to [dim].claude/settings.json[/dim]:")
-    console.print("""
+    console.print("""\
   {
     "hooks": {
       "PreToolUse":  [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python .claude/hooks/pre_tool_use.py"}]}],
@@ -284,18 +312,10 @@ def hooks_install(hooks_dir: str) -> None:
 """)
 
 
-def _write_hook(path: str, content: str) -> None:
-    with open(path, "w") as f:
-        f.write(content)
-
-
 _PRE_TOOL_USE_SCRIPT = '''\
 #!/usr/bin/env python3
 """PreToolUse hook — translates bash commands before Claude Code executes them."""
-import json
-import os
-import sys
-import tempfile
+import json, os, sys, tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -336,11 +356,8 @@ sys.exit(0)
 
 _POST_TOOL_USE_SCRIPT = '''\
 #!/usr/bin/env python3
-"""PostToolUse hook — stores command outcomes back to Qdrant."""
-import json
-import os
-import sys
-import tempfile
+"""PostToolUse hook — stores command outcomes back to local memory."""
+import json, os, sys, tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook — stores command outcomes back to Qdrant."""
+"""PostToolUse hook â€” stores command outcomes to local SQLite memory."""
 import json
 import os
 import sys
