@@ -92,13 +92,16 @@ def start_daemon(port: int = 7842, host: str = "127.0.0.1") -> dict:
     """
     status = get_status()
     if status["running"]:
-        return {
-            "started": False,
-            "reason": "already_running",
-            "pid": status["pid"],
-            "port": status["port"],
-            "host": status["host"],
-        }
+        if status["port"] == port and status.get("host", "127.0.0.1") == host:
+            return {
+                "started": False,
+                "reason": "already_running",
+                "pid": status["pid"],
+                "port": status["port"],
+                "host": status["host"],
+            }
+        # Running on a different port/host — stop the old daemon and start fresh.
+        stop_daemon()
 
     actual_port = _find_available_port(port, host)
 

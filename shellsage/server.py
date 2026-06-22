@@ -167,9 +167,16 @@ async def _translate_sse_stream(upstream_resp, client):
                 yield "data: [DONE]\n\n"
                 continue
 
+            if not data_str:
+                # Empty data field — skip rather than forward, as the client
+                # would try JSON.parse("") → "Unexpected EOF".
+                continue
+
             try:
                 event = json.loads(data_str)
             except json.JSONDecodeError:
+                # Malformed JSON from upstream; forward as-is and let the
+                # client decide what to do with it.
                 yield raw_line + "\n"
                 continue
 
@@ -192,7 +199,8 @@ async def _translate_sse_stream(upstream_resp, client):
 
             elif etype == "content_block_stop" and idx in bash_buffers:
                 parts = bash_buffers.pop(idx)
-                translated = _translate_bash_input("".join(parts))
+                assembled = "".join(parts) or "{}"
+                translated = _translate_bash_input(assembled)
                 # Re-emit as a single complete delta so the agent gets the translated command
                 delta_event = {
                     "type": "content_block_delta",
@@ -204,6 +212,10 @@ async def _translate_sse_stream(upstream_resp, client):
 
             else:
                 yield f"data: {json.dumps(event)}\n\n"
+    except Exception:
+        # Network/timeout errors mid-stream: close cleanly so the client sees
+        # EOF rather than a half-written JSON event.
+        pass
     finally:
         await upstream_resp.aclose()
         await client.aclose()
@@ -260,6 +272,23 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
         client = httpx.AsyncClient(timeout=120)
         req = client.build_request("POST", upstream_url, content=body, headers=forward_headers)
         upstream_resp = await client.send(req, stream=True)
+
+        # Error responses have a JSON body, not an SSE stream.  Returning them
+        # as text/event-stream would make the client try to JSON-parse raw JSON
+        # lines → "Unexpected EOF".
+        if upstream_resp.status_code >= 400:
+            error_body = await upstream_resp.aread()
+            await upstream_resp.aclose()
+            await client.aclose()
+            err_headers = {k: v for k, v in upstream_resp.headers.items()
+                           if k.lower() not in _hop_by_hop}
+            return Response(
+                content=error_body,
+                status_code=upstream_resp.status_code,
+                media_type=upstream_resp.headers.get("content-type", "application/json"),
+                headers=err_headers,
+            )
+
         resp_headers = {k: v for k, v in upstream_resp.headers.items()
                         if k.lower() not in {*_hop_by_hop, "content-encoding"}}
         return StreamingResponse(
