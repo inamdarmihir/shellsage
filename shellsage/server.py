@@ -1,6 +1,19 @@
-"""ShellSage MCP server — exposes 4 tools to Claude Code and GitHub Copilot."""
+"""ShellSage MCP server + Anthropic API proxy.
+
+Two integration modes on the same port:
+
+  MCP (Claude Code tool registration):
+    http://HOST:PORT/sse  — register with: claude mcp add --transport sse shellsage <url>
+
+  Anthropic API proxy (intercepts bash commands before the agent sees them):
+    Set ANTHROPIC_BASE_URL=http://HOST:PORT and run claude normally.
+    All /v1/messages requests are forwarded to api.anthropic.com after
+    translating any Bash tool_use commands for the current OS/shell.
+"""
 
 from __future__ import annotations
+
+import json
 
 from shellsage.config import DB_PATH as _DEFAULT_DB
 from shellsage.config import SERVER_HOST, SERVER_PORT
@@ -14,8 +27,12 @@ except ImportError as e:
         "MCP support requires the 'mcp' extra: pip install 'shellsage[mcp]'"
     ) from e
 
+ANTHROPIC_API_BASE = "https://api.anthropic.com"
+
 mcp = FastMCP("shellsage")
 
+
+# ── MCP tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def translate_command(command: str, project_root: str = ".") -> dict:
@@ -85,12 +102,175 @@ def get_stats() -> dict:
     """Return collection sizes from local memory — useful for health checks."""
     try:
         from shellsage import store
-
         counts = store.get_stats()
         return {"status": "ok", "db": _DEFAULT_DB, "counts": counts}
     except Exception as exc:
         return {"status": "error", "detail": str(exc)}
 
+
+# ── Anthropic API proxy helpers ───────────────────────────────────────────────
+
+def _translate_bash_input(input_json: str) -> str:
+    """Translate the 'command' field in a Bash tool_use input JSON string."""
+    try:
+        tool_input = json.loads(input_json)
+        command = tool_input.get("command", "")
+        if not command:
+            return input_json
+        ctx = ShellContext.detect()
+        result = translate(command, ctx)
+        if result.was_changed:
+            tool_input["command"] = result.translated
+            return json.dumps(tool_input)
+    except Exception:
+        pass
+    return input_json
+
+
+def _translate_tool_uses_in_response(response: dict) -> dict:
+    """Translate Bash commands in a non-streaming Anthropic API response."""
+    try:
+        for block in response.get("content", []):
+            if block.get("type") == "tool_use" and block.get("name") in ("Bash", "bash"):
+                command = block.get("input", {}).get("command", "")
+                if command:
+                    ctx = ShellContext.detect()
+                    result = translate(command, ctx)
+                    if result.was_changed:
+                        block["input"]["command"] = result.translated
+    except Exception:
+        pass
+    return response
+
+
+async def _translate_sse_stream(upstream_resp, client):
+    """Yield SSE lines from *upstream_resp*, translating Bash tool_use commands.
+
+    Bash tool input deltas are buffered until content_block_stop, then the
+    assembled command is translated and re-emitted as a single delta.
+    """
+    # index -> list of partial_json fragments
+    bash_buffers: dict[int, list[str]] = {}
+
+    try:
+        async for raw_line in upstream_resp.aiter_lines():
+            if not raw_line:
+                yield "\n"
+                continue
+
+            if not raw_line.startswith("data:"):
+                yield raw_line + "\n"
+                continue
+
+            data_str = raw_line[5:].strip()
+            if data_str == "[DONE]":
+                yield "data: [DONE]\n\n"
+                continue
+
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                yield raw_line + "\n"
+                continue
+
+            etype = event.get("type", "")
+            idx = event.get("index", 0)
+
+            if etype == "content_block_start":
+                block = event.get("content_block", {})
+                if block.get("type") == "tool_use" and block.get("name") in ("Bash", "bash"):
+                    bash_buffers[idx] = []
+                yield f"data: {json.dumps(event)}\n\n"
+
+            elif etype == "content_block_delta" and idx in bash_buffers:
+                delta = event.get("delta", {})
+                if delta.get("type") == "input_json_delta":
+                    bash_buffers[idx].append(delta.get("partial_json", ""))
+                    # buffered — don't emit yet
+                else:
+                    yield f"data: {json.dumps(event)}\n\n"
+
+            elif etype == "content_block_stop" and idx in bash_buffers:
+                parts = bash_buffers.pop(idx)
+                translated = _translate_bash_input("".join(parts))
+                # Re-emit as a single complete delta so the agent gets the translated command
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "input_json_delta", "partial_json": translated},
+                }
+                yield f"data: {json.dumps(delta_event)}\n\n"
+                yield f"data: {json.dumps(event)}\n\n"
+
+            else:
+                yield f"data: {json.dumps(event)}\n\n"
+    finally:
+        await upstream_resp.aclose()
+        await client.aclose()
+
+
+# ── Starlette route handlers ──────────────────────────────────────────────────
+
+async def _health(request):  # type: ignore[no-untyped-def]
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok", "service": "shellsage"})
+
+
+async def _proxy_messages(request):  # type: ignore[no-untyped-def]
+    """Forward /v1/messages to Anthropic, intercepting Bash tool commands."""
+    from starlette.responses import JSONResponse, Response, StreamingResponse
+
+    try:
+        import httpx  # type: ignore[import-untyped]
+    except ImportError:
+        return JSONResponse(
+            {"error": "httpx is required for proxy mode: pip install 'shellsage[mcp]'"},
+            status_code=500,
+        )
+
+    body = await request.body()
+    try:
+        body_json = json.loads(body)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    # Strip hop-by-hop headers before forwarding
+    _hop_by_hop = {"host", "content-length", "transfer-encoding", "connection",
+                   "keep-alive", "proxy-authenticate", "proxy-authorization",
+                   "te", "trailers", "upgrade"}
+    forward_headers = {k: v for k, v in request.headers.items()
+                       if k.lower() not in _hop_by_hop}
+
+    upstream_url = f"{ANTHROPIC_API_BASE}/v1/messages"
+    stream = body_json.get("stream", False)
+
+    if not stream:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(upstream_url, content=body, headers=forward_headers)
+        resp_headers = {k: v for k, v in resp.headers.items()
+                        if k.lower() not in _hop_by_hop}
+        try:
+            result = _translate_tool_uses_in_response(resp.json())
+            return JSONResponse(result, status_code=resp.status_code, headers=resp_headers)
+        except Exception:
+            return Response(content=resp.content, status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type", "application/json"),
+                            headers=resp_headers)
+    else:
+        client = httpx.AsyncClient(timeout=120)
+        req = client.build_request("POST", upstream_url, content=body, headers=forward_headers)
+        upstream_resp = await client.send(req, stream=True)
+        resp_headers = {k: v for k, v in upstream_resp.headers.items()
+                        if k.lower() not in {*_hop_by_hop, "content-encoding"}}
+        return StreamingResponse(
+            _translate_sse_stream(upstream_resp, client),
+            status_code=upstream_resp.status_code,
+            media_type="text/event-stream",
+            headers=resp_headers,
+        )
+
+
+# ── Server entrypoint ─────────────────────────────────────────────────────────
 
 def run(transport: str = "stdio", port: int = SERVER_PORT, host: str = SERVER_HOST) -> None:
     if transport == "http":
@@ -107,18 +287,33 @@ def _run_http(host: str, port: int) -> None:
             "HTTP mode requires uvicorn: pip install 'shellsage[mcp]'"
         ) from None
 
-    # FastMCP exposes an ASGI app; try the newer API first then fall back.
+    app = _build_app()
+    uvicorn.run(app, host=host, port=port, log_level="error")
+
+
+def _build_app():
+    """Return an ASGI app combining the MCP server and the Anthropic proxy."""
+    from starlette.applications import Starlette
+    from starlette.routing import Mount, Route
+
+    # Try to get the MCP ASGI app from FastMCP
+    mcp_app = None
     try:
-        app = mcp.streamable_http_app()  # type: ignore[attr-defined]
+        mcp_app = mcp.streamable_http_app()  # type: ignore[attr-defined]
     except AttributeError:
         try:
-            app = mcp.sse_app()  # type: ignore[attr-defined]
+            mcp_app = mcp.sse_app()  # type: ignore[attr-defined]
         except AttributeError:
-            # Last resort: let FastMCP handle it via run() kwargs
-            mcp.run(transport="sse")  # type: ignore[call-arg]
-            return
+            pass
 
-    uvicorn.run(app, host=host, port=port, log_level="error")
+    routes = [
+        Route("/v1/messages", endpoint=_proxy_messages, methods=["POST"]),
+        Route("/health", endpoint=_health, methods=["GET"]),
+    ]
+    if mcp_app is not None:
+        routes.append(Mount("/", app=mcp_app))
+
+    return Starlette(routes=routes)
 
 
 if __name__ == "__main__":

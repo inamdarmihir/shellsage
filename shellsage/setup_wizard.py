@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -88,6 +89,14 @@ def _register_windsurf(mcp_url: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _proxy_launch_command(host: str, port: int) -> str:
+    """Return the shell command to launch Claude Code through the ShellSage proxy."""
+    base_url = f"http://{host}:{port}"
+    if sys.platform == "win32":
+        return f'$env:ANTHROPIC_BASE_URL="{base_url}"; claude'
+    return f"ANTHROPIC_BASE_URL={base_url} claude"
+
+
 def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
     console.print()
     console.print(
@@ -137,21 +146,26 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
         _fail(str(exc))
 
     # ── Step 3: Start background server ──────────────────────────────────────
-    _step(3, steps_total, f"Starting background MCP server on port {port}")
+    _step(3, steps_total, f"Starting background MCP + proxy server (preferred port {port})")
     server_started = False
+    actual_port = port
     server_pid = None
     try:
         from shellsage.daemon import start_daemon
         result = start_daemon(port=port, host=host)
         if result.get("started"):
             server_pid = result["pid"]
+            actual_port = result["port"]
+            if actual_port != port:
+                _warn(f"Port {port} was in use — started on port {actual_port} instead")
             time.sleep(2)  # allow uvicorn to bind
-            _ok(f"PID {server_pid}  |  http://{host}:{port}/sse")
+            _ok(f"PID {server_pid}  |  http://{host}:{actual_port}/sse")
             server_started = True
             steps_passed += 1
         elif result.get("reason") == "already_running":
             server_pid = result.get("pid")
-            _ok(f"Already running  (PID {server_pid})")
+            actual_port = result.get("port", port)
+            _ok(f"Already running  (PID {server_pid} | port {actual_port})")
             server_started = True
             steps_passed += 1
         else:
@@ -161,7 +175,7 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
         _fail(str(exc))
 
     # ── Step 4: Detect IDEs and register MCP server ──────────────────────────
-    mcp_url = f"http://{host}:{port}/sse"
+    mcp_url = f"http://{host}:{actual_port}/sse"
     _step(4, steps_total, "Detecting IDE / agent tools")
     ides = _detect_ides()
     selected_ides: list[dict] = []
@@ -233,23 +247,21 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
 
     try:
         from shellsage import store as _store
-        from shellsage.config import DB_PATH
         db_counts = _store.get_stats()
         table.add_row("Translations", str(db_counts["translations"]))
         table.add_row("Failures logged", str(db_counts["failures"]))
     except Exception:
         pass
 
-    if server_pid:
-        table.add_row("MCP server", f"http://{host}:{port}/sse  (PID {server_pid})")
+    if server_started:
+        table.add_row("MCP endpoint", f"http://{host}:{actual_port}/sse  (PID {server_pid})")
+        table.add_row("Proxy endpoint", f"http://{host}:{actual_port}/v1/messages")
     table.add_row("Logs", str(Path.home() / ".shellsage" / "shellsage.log"))
 
     if steps_passed == steps_total:
         console.print(
             Panel(table, title="[bold green]Setup complete[/bold green]", border_style="green")
         )
-        console.print()
-        console.print("  Open Claude Code and run any bash command  -  ShellSage translates it.")
     else:
         console.print(
             Panel(
@@ -260,6 +272,26 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
         )
         console.print()
         console.print("  Fix the warnings above, then run [dim]shellsage setup[/dim] again.")
+
+    # ── Usage instructions ────────────────────────────────────────────────────
+    if server_started:
+        console.print()
+        console.print(Rule("How to use ShellSage", style="dim"))
+        console.print()
+
+        console.print("  [bold]Option A — MCP tools[/bold]  (hooks translate commands automatically)")
+        console.print(f"    [dim]Open Claude Code — ShellSage translates every Bash command it runs.[/dim]")
+        console.print()
+
+        proxy_cmd = _proxy_launch_command(host, actual_port)
+        console.print("  [bold]Option B — Anthropic API proxy[/bold]  (intercepts requests before the LLM responds)")
+        console.print(f"    ShellSage sits between Claude Code and the Anthropic API.")
+        console.print(f"    Every bash command in the model's response is translated on the fly.")
+        console.print()
+        console.print(f"    Launch Claude Code with:")
+        console.print(f"      [bold cyan]{proxy_cmd}[/bold cyan]")
+        console.print()
+        console.print(f"    [dim]ShellSage forwards all other requests to api.anthropic.com unchanged.[/dim]")
 
     console.print()
 

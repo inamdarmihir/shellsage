@@ -204,22 +204,34 @@ def mcp(transport: str, port: int, host: str) -> None:
 @click.option("--port", default=SERVER_PORT, show_default=True, envvar="SHELLSAGE_PORT")
 @click.option("--host", default=SERVER_HOST, show_default=True, envvar="SHELLSAGE_HOST")
 def start(port: int, host: str) -> None:
-    """Start the MCP server as a background daemon."""
+    """Start the MCP + proxy server as a background daemon."""
+    import sys as _sys
     from shellsage.daemon import start_daemon
 
     result = start_daemon(port=port, host=host)
     if result.get("started"):
+        actual_port = result["port"]
+        pid = result["pid"]
+        if actual_port != port:
+            console.print(f"[yellow]![/yellow] Port {port} was in use — using port {actual_port}")
         console.print(
             f"[green]>[/green] ShellSage daemon started  "
-            f"(PID {result['pid']} | http://{host}:{port}/sse)"
+            f"(PID {pid} | http://{host}:{actual_port}/sse)"
         )
+        console.print(f"\n[bold]MCP integration[/bold] — register with Claude Code:")
         console.print(
-            f"\nRegister with Claude Code:\n"
-            f"  [dim]claude mcp add --transport sse shellsage http://{host}:{port}/sse[/dim]"
+            f"  [dim]claude mcp add --transport sse shellsage http://{host}:{actual_port}/sse[/dim]"
         )
+        if _sys.platform == "win32":
+            proxy_cmd = f'$env:ANTHROPIC_BASE_URL="http://{host}:{actual_port}"; claude'
+        else:
+            proxy_cmd = f"ANTHROPIC_BASE_URL=http://{host}:{actual_port} claude"
+        console.print(f"\n[bold]Proxy integration[/bold] — route all LLM calls through ShellSage:")
+        console.print(f"  [dim]{proxy_cmd}[/dim]")
     elif result.get("reason") == "already_running":
+        actual_port = result.get("port", port)
         console.print(
-            f"[yellow]![/yellow] Already running  (PID {result.get('pid')})"
+            f"[yellow]![/yellow] Already running  (PID {result.get('pid')} | port {actual_port})"
         )
     else:
         console.print(f"[red]X[/red] Could not start daemon: {result}")
@@ -253,8 +265,16 @@ def status() -> None:
     table.add_column()
 
     if daemon_status["running"]:
+        actual_port = daemon_status.get("port") or SERVER_PORT
+        actual_host = daemon_status.get("host") or SERVER_HOST
         table.add_row("Daemon", f"[green]running[/green]  (PID {daemon_status['pid']})")
-        table.add_row("MCP endpoint", f"http://{SERVER_HOST}:{SERVER_PORT}/sse")
+        table.add_row("MCP endpoint", f"http://{actual_host}:{actual_port}/sse")
+        table.add_row("Proxy endpoint", f"http://{actual_host}:{actual_port}/v1/messages")
+        if sys.platform == "win32":
+            proxy_cmd = f'$env:ANTHROPIC_BASE_URL="http://{actual_host}:{actual_port}"; claude'
+        else:
+            proxy_cmd = f"ANTHROPIC_BASE_URL=http://{actual_host}:{actual_port} claude"
+        table.add_row("Proxy launch", proxy_cmd)
     else:
         table.add_row("Daemon", "[red]stopped[/red]")
         table.add_row("", "[dim]Run: shellsage start[/dim]")
