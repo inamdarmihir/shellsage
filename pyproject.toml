@@ -84,4 +84,4 @@ warn_unused_ignores = true
 # ── Pytest ────────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short --cov=shellsage --cov-report=term-missing"
+addopts = "-v --tb=short"
