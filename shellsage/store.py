@@ -10,6 +10,9 @@ from pathlib import Path
 
 from shellsage.config import DB_PATH as _DEFAULT_DB
 
+# Paths where ensure_tables() has already run this process — skips the DDL on re-entry.
+_ensured_paths: set[str] = set()
+
 
 # ── connection ────────────────────────────────────────────────────────────────
 
@@ -78,16 +81,22 @@ END""",
 
 
 def ensure_tables(db_path: str | None = None) -> bool:
-    """Create schema. Returns True if FTS5 is available."""
+    """Create schema. Returns True if FTS5 is available.
+
+    Idempotent per process: subsequent calls for the same path are no-ops.
+    """
+    path = db_path or _DEFAULT_DB
+    if path in _ensured_paths:
+        return True
     conn = _connect(db_path)
     with conn:
         for stmt in _DDL.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
                 conn.execute(stmt)
-
     has_fts5 = _setup_fts5(conn)
     conn.close()
+    _ensured_paths.add(path)
     return has_fts5
 
 
@@ -152,23 +161,32 @@ def query_translation(
 ) -> list[dict]:
     conn = _connect(db_path)
 
-    # Always fetch rows for the Python BM25 fallback (also used to check if DB is populated)
-    rows = conn.execute(
-        "SELECT bash_cmd, translated_cmd, confidence, hits FROM translations WHERE os_name=? AND shell=?",
+    # Cheap existence check — avoids a full-table scan when the DB is empty.
+    has_rows = conn.execute(
+        "SELECT 1 FROM translations WHERE os_name=? AND shell=? LIMIT 1",
         (os_name, shell),
-    ).fetchall()
-
-    if not rows:
+    ).fetchone()
+    if not has_rows:
         conn.close()
         return []
 
-    # Try FTS5 first — only use its results if non-empty (FTS5 may exist but be un-synced)
+    # Prefer FTS5 (fast, index-backed).  Returns None only when FTS5 is unavailable.
     fts_results = _query_fts5(conn, bash_cmd, shell, os_name, limit, score_threshold)
-    conn.close()
-    if fts_results:
+    if fts_results is not None:
+        conn.close()
         return fts_results
 
-    # Python-side BM25 fallback
+    # FTS5 unavailable: Python-side BM25 over a bounded corpus (≤500 rows).
+    rows = conn.execute(
+        "SELECT bash_cmd, translated_cmd, confidence, hits "
+        "FROM translations WHERE os_name=? AND shell=? LIMIT 500",
+        (os_name, shell),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return []
+
     docs = [
         {"bash_cmd": r["bash_cmd"], "translated_cmd": r["translated_cmd"],
          "confidence": r["confidence"], "hits": r["hits"]}

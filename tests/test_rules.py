@@ -252,3 +252,143 @@ def test_whitespace_only():
 def test_unknown_command_passes_through():
     exotic = "some-unknown-tool --flag value"
     assert ps(exotic) == exotic
+
+# ── grep context lines & line numbers ────────────────────────────────────────
+
+
+def test_grep_n_line_numbers():
+    result = ps("grep -n 'error' app.log")
+    assert "Select-String" in result
+    assert "LineNumber" in result
+
+
+def test_grep_rn_recursive_line_numbers():
+    result = ps("grep -rn 'TODO' src/")
+    assert "Select-String" in result
+    assert "LineNumber" in result
+    assert "Path" in result
+
+
+def test_grep_A_context_after():
+    result = ps("grep -A 3 'error' app.log")
+    assert "Select-String" in result
+    assert "-Context 0,3" in result
+
+
+def test_grep_B_context_before():
+    result = ps("grep -B 2 'error' app.log")
+    assert "Select-String" in result
+    assert "-Context 2,0" in result
+
+
+def test_grep_C_context_both():
+    result = ps("grep -C 5 'error' app.log")
+    assert "Select-String" in result
+    assert "-Context 5,5" in result
+
+
+# ── compound cat | filter rules ───────────────────────────────────────────────
+
+
+def test_cat_pipe_head_n():
+    result = ps("cat bigfile.py | head -n 50")
+    assert "Get-Content" in result
+    assert "bigfile.py" in result
+    assert "-TotalCount 50" in result
+    # must NOT contain bare 'head' (would be untranslated bash)
+    assert "head" not in result
+
+
+def test_cat_pipe_head_bare():
+    result = ps("cat bigfile.py | head")
+    assert "-TotalCount 10" in result
+    assert "head" not in result
+
+
+def test_cat_pipe_tail_n():
+    result = ps("cat app.log | tail -n 20")
+    assert "Get-Content" in result
+    assert "-Tail 20" in result
+    assert "tail" not in result
+
+
+def test_cat_pipe_wc_l():
+    result = ps("cat file.txt | wc -l")
+    assert "Get-Content" in result
+    assert "Count" in result
+    assert "wc" not in result
+
+
+def test_cat_pipe_grep():
+    result = ps("cat app.log | grep 'error'")
+    assert "Select-String" in result
+    assert "app.log" in result
+    assert "error" in result
+    assert "cat" not in result
+
+
+def test_cat_pipe_grep_i():
+    result = ps("cat app.log | grep -i 'ERROR'")
+    assert "Select-String" in result
+    assert "CaseSensitive" in result
+    assert "cat" not in result
+
+
+# ── ls | grep ─────────────────────────────────────────────────────────────────
+
+
+def test_ls_pipe_grep():
+    result = ps("ls | grep '.py'")
+    assert "Get-ChildItem" in result
+    assert "Where-Object" in result
+    assert "grep" not in result
+
+
+def test_ls_pipe_grep_i():
+    result = ps("ls | grep -i 'test'")
+    assert "Get-ChildItem" in result
+    assert "imatch" in result
+
+
+# ── find | xargs grep ─────────────────────────────────────────────────────────
+
+
+def test_find_xargs_grep():
+    result = ps("find . -name '*.py' | xargs grep 'import'")
+    assert "Get-ChildItem" in result
+    assert "Select-String" in result
+    assert "xargs" not in result
+    assert "grep" not in result
+
+
+def test_find_type_f_xargs_grep():
+    result = ps("find . -type f | xargs grep 'TODO'")
+    assert "Get-ChildItem" in result
+    assert "Select-String" in result
+    assert "xargs" not in result
+
+
+# ── multi-pass: pipe chains of bash filters ───────────────────────────────────
+
+
+def test_multipass_pipe_grep_then_head():
+    """grep | head — both filters translated even though they're stacked."""
+    result = ps("some_tool | grep 'error' | head -n 5")
+    assert "Where-Object" in result
+    assert "Select-Object -First 5" in result
+    assert "grep" not in result
+    assert "head" not in result
+
+
+def test_multipass_pipe_grep_then_sort():
+    result = ps("some_tool | grep 'warn' | sort")
+    assert "Where-Object" in result
+    assert "Sort-Object" in result
+    assert "grep" not in result
+    assert "sort" not in result
+
+
+def test_multipass_pipe_grep_v_then_head():
+    result = ps("some_tool | grep -v 'debug' | head -n 10")
+    assert "notmatch" in result
+    assert "Select-Object -First 10" in result

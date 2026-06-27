@@ -335,7 +335,7 @@ def hooks_install(hooks_dir: str) -> None:
 _PRE_TOOL_USE_SCRIPT = '''\
 #!/usr/bin/env python3
 """PreToolUse hook — translates bash commands before Claude Code executes them."""
-import json, os, sys, tempfile
+import hashlib, json, os, sys, tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -349,10 +349,12 @@ try:
     from shellsage.models import ShellContext
     from shellsage.translator import translate
 
-    ctx = ShellContext.detect()
+    ctx = ShellContext.get_cached()
     result = translate(command, ctx)
     if result.was_changed:
-        cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
+        # Use a per-command hash so concurrent hook invocations don\'t clobber each other.
+        cmd_hash = hashlib.md5(command.encode()).hexdigest()[:12]
+        cache_path = os.path.join(tempfile.gettempdir(), f"shellsage_{cmd_hash}.json")
         try:
             with open(cache_path, "w") as fh:
                 json.dump({"original": result.original, "translated": result.translated}, fh)
@@ -377,7 +379,7 @@ sys.exit(0)
 _POST_TOOL_USE_SCRIPT = '''\
 #!/usr/bin/env python3
 """PostToolUse hook — stores command outcomes back to local memory."""
-import json, os, sys, tempfile
+import hashlib, json, os, sys, tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -396,11 +398,12 @@ try:
     from shellsage.models import CommandOutcome, ShellContext
     from shellsage.translator import store_outcome
 
-    ctx = ShellContext.detect()
+    ctx = ShellContext.get_cached()
 
     original   = command
     translated = command
-    cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
+    cmd_hash   = hashlib.md5(command.encode()).hexdigest()[:12]
+    cache_path = os.path.join(tempfile.gettempdir(), f"shellsage_{cmd_hash}.json")
     try:
         with open(cache_path) as fh:
             cached = json.load(fh)

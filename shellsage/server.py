@@ -42,7 +42,7 @@ def translate_command(command: str, project_root: str = ".") -> dict:
     Returns the (possibly rewritten) command and metadata.
     Call this from a PreToolUse hook before executing any bash command.
     """
-    ctx = ShellContext.detect(project_root=project_root)
+    ctx = ShellContext.get_cached(project_root=project_root)
     result: Translation = translate(command, ctx)
     return {
         "original": result.original,
@@ -117,7 +117,7 @@ def _translate_bash_input(input_json: str) -> str:
         command = tool_input.get("command", "")
         if not command:
             return input_json
-        ctx = ShellContext.detect()
+        ctx = ShellContext.get_cached()
         result = translate(command, ctx)
         if result.was_changed:
             tool_input["command"] = result.translated
@@ -134,7 +134,7 @@ def _translate_tool_uses_in_response(response: dict) -> dict:
             if block.get("type") == "tool_use" and block.get("name") in ("Bash", "bash"):
                 command = block.get("input", {}).get("command", "")
                 if command:
-                    ctx = ShellContext.detect()
+                    ctx = ShellContext.get_cached()
                     result = translate(command, ctx)
                     if result.was_changed:
                         block["input"]["command"] = result.translated

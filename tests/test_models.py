@@ -1,4 +1,4 @@
-"""Tests for data models — no Qdrant or network required."""
+"""Tests for data models — no external services required."""
 
 from shellsage.models import (
     OS,

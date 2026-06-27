@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""PreToolUse hook — translates bash commands before Claude Code executes them."""
-import json
-import os
-import sys
-import tempfile
+"""PreToolUse hook â€” translates bash commands before Claude Code executes them."""
+import hashlib, json, os, sys, tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -17,10 +14,12 @@ try:
     from shellsage.models import ShellContext
     from shellsage.translator import translate
 
-    ctx = ShellContext.detect()
+    ctx = ShellContext.get_cached()
     result = translate(command, ctx)
     if result.was_changed:
-        cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
+        # Use a per-command hash so concurrent hook invocations don't clobber each other.
+        cmd_hash = hashlib.md5(command.encode()).hexdigest()[:12]
+        cache_path = os.path.join(tempfile.gettempdir(), f"shellsage_{cmd_hash}.json")
         try:
             with open(cache_path, "w") as fh:
                 json.dump({"original": result.original, "translated": result.translated}, fh)

@@ -23,6 +23,9 @@ class OS(str, Enum):
     UNKNOWN = "unknown"
 
 
+# Process-level cache: list-of-one so get_cached() can mutate it from a classmethod.
+_ctx_cache: list[ShellContext | None] = [None]
+
 @dataclass
 class ShellContext:
     """Runtime environment snapshot captured once per session."""
@@ -47,13 +50,24 @@ class ShellContext:
             project_root=project_root,
         )
 
+    @classmethod
+    def get_cached(cls, project_root: str = ".") -> "ShellContext":
+        """Return a process-level cached context (avoids repeated subprocess spawns).
+
+        Callers on hot paths (proxy, hooks) should prefer this over detect().
+        Use detect() directly only when a fresh snapshot is required.
+        """
+        if _ctx_cache[0] is None:
+            _ctx_cache[0] = cls.detect(project_root)
+        return _ctx_cache[0]
+
     @property
     def needs_translation(self) -> bool:
         """True when the shell is PowerShell or CMD — bash syntax will fail."""
         return self.shell in (Shell.POWERSHELL, Shell.CMD)
 
     def context_key(self) -> str:
-        """Stable string used as Qdrant payload filter."""
+        """Stable string key for store lookups."""
         return f"{self.os.value}:{self.shell.value}:{self.project_type}"
 
 
@@ -74,7 +88,7 @@ class Translation:
 
 @dataclass
 class CommandOutcome:
-    """Result of running a translated command, stored back to Qdrant."""
+    """Result of running a translated command, persisted to local SQLite memory."""
 
     original: str
     translated: str

@@ -1,7 +1,7 @@
 """
 Built-in rule-based bash → PowerShell translations.
 
-These run with zero Qdrant dependency — they are the cold-start safety net.
+These run with zero external dependencies — they are the cold-start safety net.
 Rules are ordered from most-specific to least-specific so the first match wins.
 """
 
@@ -28,6 +28,52 @@ _rule(
     "# ShellSage: heredoc not supported in PowerShell — use @'...'@ here-string syntax",
 )
 
+# ── compound pipe rules (must come first — beat component rules at matching) ──
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*head\s+-n\s+(\d+)\s*$",
+    lambda m: f"Get-Content '{m.group(1).strip()}' -TotalCount {m.group(2)}",
+)
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*head\s*$",
+    lambda m: f"Get-Content '{m.group(1).strip()}' -TotalCount 10",
+)
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*tail\s+-n\s+(\d+)\s*$",
+    lambda m: f"Get-Content '{m.group(1).strip()}' -Tail {m.group(2)}",
+)
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*tail\s*$",
+    lambda m: f"Get-Content '{m.group(1).strip()}' -Tail 10",
+)
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*wc\s+-l\s*$",
+    lambda m: f"(Get-Content '{m.group(1).strip()}').Count",
+)
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*grep\s+-i\s+['\"]?([^'\"|]+?)['\"]?\s*$",
+    lambda m: f"Select-String -Pattern '{m.group(2).strip()}' -Path '{m.group(1).strip()}' -CaseSensitive:$false",
+)
+_rule(
+    r"^cat\s+([^|]+?)\s*\|\s*grep\s+['\"]?([^'\"|]+?)['\"]?\s*$",
+    lambda m: f"Select-String -Pattern '{m.group(2).strip()}' -Path '{m.group(1).strip()}'",
+)
+_rule(
+    r"^ls\s*\|\s*grep\s+-i\s+['\"]?([^'\"|]+?)['\"]?\s*$",
+    lambda m: f"Get-ChildItem | Where-Object {{ $_.Name -imatch '{m.group(1).strip()}' }}",
+)
+_rule(
+    r"^ls\s*\|\s*grep\s+['\"]?([^'\"|]+?)['\"]?\s*$",
+    lambda m: f"Get-ChildItem | Where-Object {{ $_.Name -match '{m.group(1).strip()}' }}",
+)
+_rule(
+    r"^find\s+\.\s+-name\s+['\"]?([^'\"]+)['\"]?\s*\|\s*xargs\s+grep\s+['\"]?([^'\"|]+?)['\"]?\s*$",
+    lambda m: f"Get-ChildItem -Recurse -Filter '{m.group(1)}' | Select-String '{m.group(2).strip()}'",
+)
+_rule(
+    r"^find\s+\.\s+-type\s+f\s+\|\s*xargs\s+grep\s+['\"]?([^'\"|]+?)['\"]?\s*$",
+    lambda m: f"Get-ChildItem -Recurse -File | Select-String '{m.group(1).strip()}'",
+)
+
 # ── file listing ──────────────────────────────────────────────────────────────
 _rule(r"^ls\s+(-la?|-al)\s*$", "Get-ChildItem -Force")
 _rule(r"^ls\s+(-la?|-al)\s+([^|]+)$", lambda m: f"Get-ChildItem -Force '{m.group(2).strip()}'")
@@ -35,6 +81,28 @@ _rule(r"^ls\s+-lh\s*$", "Get-ChildItem | Format-List Name, Length, LastWriteTime
 _rule(r"^ls\s+-R\s*$", "Get-ChildItem -Recurse")
 _rule(r"^ls\s+([^|]+)$", lambda m: f"Get-ChildItem '{m.group(1).strip()}'")
 _rule(r"^ls\s*$", "Get-ChildItem")
+
+# ── grep (context lines + line numbers — must precede general grep rules) ────
+_rule(
+    r"^grep\s+-A\s+(\d+)\s+['\"]?([^|]+?)['\"]?\s+([^|]+)$",
+    lambda m: f"Select-String -Pattern '{m.group(2).strip()}' -Path '{m.group(3).strip()}' -Context 0,{m.group(1)}",
+)
+_rule(
+    r"^grep\s+-B\s+(\d+)\s+['\"]?([^|]+?)['\"]?\s+([^|]+)$",
+    lambda m: f"Select-String -Pattern '{m.group(2).strip()}' -Path '{m.group(3).strip()}' -Context {m.group(1)},0",
+)
+_rule(
+    r"^grep\s+-C\s+(\d+)\s+['\"]?([^|]+?)['\"]?\s+([^|]+)$",
+    lambda m: f"Select-String -Pattern '{m.group(2).strip()}' -Path '{m.group(3).strip()}' -Context {m.group(1)},{m.group(1)}",
+)
+_rule(
+    r"^grep\s+-n\s+['\"]?([^|]+?)['\"]?\s+([^|]+)$",
+    lambda m: f"Select-String -Pattern '{m.group(1).strip()}' -Path '{m.group(2).strip()}' | Select-Object LineNumber, Line",
+)
+_rule(
+    r"^grep\s+-rn\s+['\"]?([^|]+?)['\"]?\s+([^|]+)$",
+    lambda m: f"Get-ChildItem -Recurse '{m.group(2).strip()}' | Select-String -Pattern '{m.group(1).strip()}' | Select-Object Path, LineNumber, Line",
+)
 
 # ── grep ──────────────────────────────────────────────────────────────────────
 _rule(
@@ -70,15 +138,15 @@ _rule(
     lambda m: f"Select-String -Pattern '{m.group(1).strip()}' -Path '{m.group(2).strip()}'",
 )
 _rule(
-    r"\|\s*grep\s+-i\s+['\"]?(.+?)['\"]?\s*$",
+    r"\|\s*grep\s+-i\s+['\"]?([^|]+?)['\"]?\s*(?=\||$)",
     lambda m: f"| Where-Object {{ $_ -imatch '{m.group(1).strip()}' }}",
 )
 _rule(
-    r"\|\s*grep\s+-v\s+['\"]?(.+?)['\"]?\s*$",
+    r"\|\s*grep\s+-v\s+['\"]?([^|]+?)['\"]?\s*(?=\||$)",
     lambda m: f"| Where-Object {{ $_ -notmatch '{m.group(1).strip()}' }}",
 )
 _rule(
-    r"\|\s*grep\s+['\"]?(.+?)['\"]?\s*$",
+    r"\|\s*grep\s+['\"]?([^|]+?)['\"]?\s*(?=\||$)",
     lambda m: f"| Where-Object {{ $_ -match '{m.group(1).strip()}' }}",
 )
 
@@ -391,8 +459,11 @@ _rule(r"^source\s+~/.bashrc$", ". $PROFILE")
 
 
 def apply(command: str, shell: Shell) -> str:
-    """
-    Apply the first matching rule to *command*.
+    """Translate *command* for *shell*, applying rules iteratively until stable.
+
+    Multi-pass loop (max 6 iterations) handles bash pipe chains like
+    ``cmd | grep foo | head -n 10`` — each pass replaces one bash fragment,
+    and subsequent passes translate the remaining ones.
 
     Returns the translated string, or the original if no rule matched.
     Only translates for PowerShell/CMD targets.
@@ -401,19 +472,36 @@ def apply(command: str, shell: Shell) -> str:
         return command
 
     cmd = command.strip()
-    for pattern, replacement in _RULES:
-        m = pattern.search(cmd)
-        if m:
+
+    for _ in range(6):
+        fired = False
+        for pattern, replacement in _RULES:
+            m = pattern.search(cmd)
+            if not m:
+                continue
             if callable(replacement):
                 res = replacement(m)
-                # Pipe or partial match — use re.sub for inline rewrite
                 if res.startswith("|") or m.group(0) != cmd:
-                    return pattern.sub(replacement, cmd)
-                return res
-            # String replacement: use re.sub for inline pipe rewrites
-            repl_str = str(replacement)
-            if repl_str.startswith("|") or m.group(0) != cmd:
-                return pattern.sub(repl_str, cmd)
-            return repl_str
+                    candidate = pattern.sub(replacement, cmd)
+                    if candidate == cmd:
+                        continue  # rule matched but produced no change — try next
+                    cmd = candidate
+                    fired = True
+                    break  # restart rule scan with updated cmd
+                else:
+                    return res  # full-string match — nothing more to do
+            else:
+                repl_str = str(replacement)
+                if repl_str.startswith("|") or m.group(0) != cmd:
+                    candidate = pattern.sub(repl_str, cmd)
+                    if candidate == cmd:
+                        continue
+                    cmd = candidate
+                    fired = True
+                    break
+                else:
+                    return repl_str  # full-string match — nothing more to do
+        if not fired:
+            break  # no rule made progress — stable
 
-    return command
+    return cmd

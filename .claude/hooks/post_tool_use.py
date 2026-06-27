@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""PostToolUse hook — stores command outcomes to local SQLite memory."""
-import json
-import os
-import sys
-import tempfile
+"""PostToolUse hook — stores command outcomes back to local memory."""
+import hashlib, json, os, sys, tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -22,11 +19,12 @@ try:
     from shellsage.models import CommandOutcome, ShellContext
     from shellsage.translator import store_outcome
 
-    ctx = ShellContext.detect()
+    ctx = ShellContext.get_cached()
 
     original   = command
     translated = command
-    cache_path = os.path.join(tempfile.gettempdir(), "shellsage_pending.json")
+    cmd_hash   = hashlib.md5(command.encode()).hexdigest()[:12]
+    cache_path = os.path.join(tempfile.gettempdir(), f"shellsage_{cmd_hash}.json")
     try:
         with open(cache_path) as fh:
             cached = json.load(fh)
