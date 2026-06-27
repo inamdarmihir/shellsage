@@ -249,7 +249,7 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
     # Strip hop-by-hop headers before forwarding
     _hop_by_hop = {"host", "content-length", "transfer-encoding", "connection",
                    "keep-alive", "proxy-authenticate", "proxy-authorization",
-                   "te", "trailers", "upgrade"}
+                   "te", "trailers", "upgrade", "content-encoding"}
     forward_headers = {k: v for k, v in request.headers.items()
                        if k.lower() not in _hop_by_hop}
 
@@ -290,7 +290,7 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
             )
 
         resp_headers = {k: v for k, v in upstream_resp.headers.items()
-                        if k.lower() not in {*_hop_by_hop, "content-encoding"}}
+                        if k.lower() not in _hop_by_hop}
         return StreamingResponse(
             _translate_sse_stream(upstream_resp, client),
             status_code=upstream_resp.status_code,
