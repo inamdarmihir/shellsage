@@ -20,6 +20,7 @@ console = Console()
 
 # ── IDE detection ─────────────────────────────────────────────────────────────
 
+
 def _detect_ides() -> list[dict]:
     """Return a list of supported IDEs/agents found on this machine."""
     found = []
@@ -33,7 +34,9 @@ def _detect_ides() -> list[dict]:
 
     windsurf_home = Path.home() / ".codeium" / "windsurf"
     if shutil.which("windsurf") or windsurf_home.exists():
-        found.append({"name": "Windsurf", "key": "windsurf", "how": "~/.codeium/windsurf/mcp_config.json"})
+        found.append(
+            {"name": "Windsurf", "key": "windsurf", "how": "~/.codeium/windsurf/mcp_config.json"}
+        )
 
     return found
 
@@ -53,7 +56,9 @@ def _register_claude_code(mcp_url: str) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["claude", "mcp", "add", "--transport", "sse", "shellsage", mcp_url],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if result.returncode == 0:
             return True, "MCP server registered"
@@ -114,6 +119,7 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
     _step(1, steps_total, "Detecting environment")
     try:
         from shellsage.models import ShellContext
+
         ctx = ShellContext.detect()
         _ok(f"{ctx.os.value.title()}  /  {ctx.shell.value}  /  {ctx.project_type} project")
         steps_passed += 1
@@ -152,6 +158,7 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
     server_pid = None
     try:
         from shellsage.daemon import start_daemon
+
         result = start_daemon(port=port, host=host)
         if result.get("started"):
             server_pid = result["pid"]
@@ -170,7 +177,7 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
             steps_passed += 1
         else:
             _warn("Could not start server  -  MCP extra may not be installed.")
-            console.print(f"    Run:  [dim]pip install 'shellsage[mcp]'[/dim]")
+            console.print("    Run:  [dim]pip install 'shellsage[mcp]'[/dim]")
     except Exception as exc:
         _fail(str(exc))
 
@@ -247,6 +254,7 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
 
     try:
         from shellsage import store as _store
+
         db_counts = _store.get_stats()
         table.add_row("Translations", str(db_counts["translations"]))
         table.add_row("Failures logged", str(db_counts["failures"]))
@@ -279,36 +287,49 @@ def run_wizard(port: int = 7842, host: str = "127.0.0.1") -> None:
         console.print(Rule("How to use ShellSage", style="dim"))
         console.print()
 
-        console.print("  [bold]Option A — MCP tools[/bold]  (hooks translate commands automatically)")
-        console.print(f"    [dim]Open Claude Code — ShellSage translates every Bash command it runs.[/dim]")
+        console.print(
+            "  [bold]Option A — MCP tools[/bold]  (hooks translate commands automatically)"
+        )
+        console.print(
+            "    [dim]Open Claude Code — ShellSage translates every Bash command it runs.[/dim]"
+        )
         console.print()
 
         proxy_cmd = _proxy_launch_command(host, actual_port)
-        console.print("  [bold]Option B — Anthropic API proxy[/bold]  (intercepts requests before the LLM responds)")
-        console.print(f"    ShellSage sits between Claude Code and the Anthropic API.")
-        console.print(f"    Every bash command in the model's response is translated on the fly.")
+        console.print(
+            "  [bold]Option B — Anthropic API proxy[/bold]  (intercepts requests before the LLM responds)"
+        )
+        console.print("    ShellSage sits between Claude Code and the Anthropic API.")
+        console.print("    Every bash command in the model's response is translated on the fly.")
         console.print()
-        console.print(f"    Launch Claude Code with:")
+        console.print("    Launch Claude Code with:")
         console.print(f"      [bold cyan]{proxy_cmd}[/bold cyan]")
         console.print()
-        console.print(f"    [dim]ShellSage forwards all other requests to api.anthropic.com unchanged.[/dim]")
+        console.print(
+            "    [dim]ShellSage forwards all other requests to api.anthropic.com unchanged.[/dim]"
+        )
 
     console.print()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _step(n: int, total: int, msg: str) -> None:
     console.print(f"[bold cyan]Step {n}/{total}[/bold cyan]  {msg}...")
+
 
 def _ok(msg: str) -> None:
     console.print(f"  [green]>[/green]  {msg}")
 
+
 def _warn(msg: str) -> None:
     console.print(f"  [yellow]![/yellow]  {msg}")
 
+
 def _fail(msg: str) -> None:
     console.print(f"  [red]X[/red]  {msg}")
+
 
 def _skip(msg: str) -> None:
     console.print(f"  [dim]-  {msg}[/dim]")
@@ -339,10 +360,20 @@ def _ensure_hook_settings(settings_path: Path) -> None:
     hook_config = {
         "hooks": {
             "PreToolUse": [
-                {"matcher": "Bash", "hooks": [{"type": "command", "command": "python .claude/hooks/pre_tool_use.py"}]}
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "python .claude/hooks/pre_tool_use.py"}
+                    ],
+                }
             ],
             "PostToolUse": [
-                {"matcher": "Bash", "hooks": [{"type": "command", "command": "python .claude/hooks/post_tool_use.py"}]}
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "python .claude/hooks/post_tool_use.py"}
+                    ],
+                }
             ],
         }
     }

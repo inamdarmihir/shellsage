@@ -14,6 +14,8 @@ Two integration modes on the same port:
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import suppress
 
 from shellsage.config import DB_PATH as _DEFAULT_DB
 from shellsage.config import SERVER_HOST, SERVER_PORT
@@ -23,9 +25,7 @@ from shellsage.translator import store_outcome, translate
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore
 except ImportError as e:
-    raise ImportError(
-        "MCP support requires the 'mcp' extra: pip install 'shellsage[mcp]'"
-    ) from e
+    raise ImportError("MCP support requires the 'mcp' extra: pip install 'shellsage[mcp]'") from e
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 
@@ -33,6 +33,7 @@ mcp = FastMCP("shellsage")
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
+
 
 @mcp.tool()
 def translate_command(command: str, project_root: str = ".") -> dict:
@@ -50,6 +51,7 @@ def translate_command(command: str, project_root: str = ".") -> dict:
         "changed": result.was_changed,
         "confidence": round(result.confidence, 3),
         "source": result.source,
+        "ref": result.ref,
         "shell": ctx.shell.value,
         "os": ctx.os.value,
     }
@@ -102,6 +104,7 @@ def get_stats() -> dict:
     """Return collection sizes from local memory — useful for health checks."""
     try:
         from shellsage import store
+
         counts = store.get_stats()
         return {"status": "ok", "db": _DEFAULT_DB, "counts": counts}
     except Exception as exc:
@@ -110,8 +113,15 @@ def get_stats() -> dict:
 
 # ── Anthropic API proxy helpers ───────────────────────────────────────────────
 
+
 def _translate_bash_input(input_json: str) -> str:
-    """Translate the 'command' field in a Bash tool_use input JSON string."""
+    """Translate the 'command' field in a Bash tool_use input JSON string.
+
+    When a translation fires, appends a ``# shellsage-ref: <url>`` comment to
+    the command so the citation travels with the command in agent logs.
+    For passthrough commands the ref is added as a comment only when a known
+    docs URL exists, keeping the command unchanged for unknown tools.
+    """
     try:
         tool_input = json.loads(input_json)
         command = tool_input.get("command", "")
@@ -119,8 +129,11 @@ def _translate_bash_input(input_json: str) -> str:
             return input_json
         ctx = ShellContext.get_cached()
         result = translate(command, ctx)
-        if result.was_changed:
-            tool_input["command"] = result.translated
+        final_cmd = result.translated
+        if result.ref:
+            final_cmd = f"{final_cmd}  # shellsage-ref: {result.ref}"
+        if final_cmd != command:
+            tool_input["command"] = final_cmd
             return json.dumps(tool_input)
     except Exception:
         pass
@@ -136,14 +149,17 @@ def _translate_tool_uses_in_response(response: dict) -> dict:
                 if command:
                     ctx = ShellContext.get_cached()
                     result = translate(command, ctx)
-                    if result.was_changed:
-                        block["input"]["command"] = result.translated
+                    final_cmd = result.translated
+                    if result.ref:
+                        final_cmd = f"{final_cmd}  # shellsage-ref: {result.ref}"
+                    if final_cmd != command:
+                        block["input"]["command"] = final_cmd
     except Exception:
         pass
     return response
 
 
-async def _translate_sse_stream(upstream_resp, client):
+async def _translate_sse_stream(upstream_resp, client) -> AsyncIterator[str]:
     """Yield SSE lines from *upstream_resp*, translating Bash tool_use commands.
 
     Bash tool input deltas are buffered until content_block_stop, then the
@@ -223,8 +239,10 @@ async def _translate_sse_stream(upstream_resp, client):
 
 # ── Starlette route handlers ──────────────────────────────────────────────────
 
+
 async def _health(request):  # type: ignore[no-untyped-def]
     from starlette.responses import JSONResponse
+
     return JSONResponse({"status": "ok", "service": "shellsage"})
 
 
@@ -247,11 +265,19 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     # Strip hop-by-hop headers before forwarding
-    _hop_by_hop = {"host", "content-length", "transfer-encoding", "connection",
-                   "keep-alive", "proxy-authenticate", "proxy-authorization",
-                   "te", "trailers", "upgrade"}
-    forward_headers = {k: v for k, v in request.headers.items()
-                       if k.lower() not in _hop_by_hop}
+    _hop_by_hop = {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "upgrade",
+    }
+    forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in _hop_by_hop}
 
     upstream_url = f"{ANTHROPIC_API_BASE}/v1/messages"
     stream = body_json.get("stream", False)
@@ -259,15 +285,17 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
     if not stream:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(upstream_url, content=body, headers=forward_headers)
-        resp_headers = {k: v for k, v in resp.headers.items()
-                        if k.lower() not in _hop_by_hop}
+        resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _hop_by_hop}
         try:
             result = _translate_tool_uses_in_response(resp.json())
             return JSONResponse(result, status_code=resp.status_code, headers=resp_headers)
         except Exception:
-            return Response(content=resp.content, status_code=resp.status_code,
-                            media_type=resp.headers.get("content-type", "application/json"),
-                            headers=resp_headers)
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/json"),
+                headers=resp_headers,
+            )
     else:
         client = httpx.AsyncClient(timeout=120)
         req = client.build_request("POST", upstream_url, content=body, headers=forward_headers)
@@ -280,8 +308,9 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
             error_body = await upstream_resp.aread()
             await upstream_resp.aclose()
             await client.aclose()
-            err_headers = {k: v for k, v in upstream_resp.headers.items()
-                           if k.lower() not in _hop_by_hop}
+            err_headers = {
+                k: v for k, v in upstream_resp.headers.items() if k.lower() not in _hop_by_hop
+            }
             return Response(
                 content=error_body,
                 status_code=upstream_resp.status_code,
@@ -289,8 +318,11 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
                 headers=err_headers,
             )
 
-        resp_headers = {k: v for k, v in upstream_resp.headers.items()
-                        if k.lower() not in {*_hop_by_hop, "content-encoding"}}
+        resp_headers = {
+            k: v
+            for k, v in upstream_resp.headers.items()
+            if k.lower() not in {*_hop_by_hop, "content-encoding"}
+        }
         return StreamingResponse(
             _translate_sse_stream(upstream_resp, client),
             status_code=upstream_resp.status_code,
@@ -300,6 +332,7 @@ async def _proxy_messages(request):  # type: ignore[no-untyped-def]
 
 
 # ── Server entrypoint ─────────────────────────────────────────────────────────
+
 
 def run(transport: str = "stdio", port: int = SERVER_PORT, host: str = SERVER_HOST) -> None:
     if transport == "http":
@@ -312,9 +345,7 @@ def _run_http(host: str, port: int) -> None:
     try:
         import uvicorn  # type: ignore[import-untyped]
     except ImportError:
-        raise ImportError(
-            "HTTP mode requires uvicorn: pip install 'shellsage[mcp]'"
-        ) from None
+        raise ImportError("HTTP mode requires uvicorn: pip install 'shellsage[mcp]'") from None
 
     app = _build_app()
     uvicorn.run(app, host=host, port=port, log_level="error")
@@ -323,19 +354,17 @@ def _run_http(host: str, port: int) -> None:
 def _build_app():
     """Return an ASGI app combining the MCP server and the Anthropic proxy."""
     from starlette.applications import Starlette
-    from starlette.routing import Mount, Route
+    from starlette.routing import BaseRoute, Mount, Route
 
     # Try to get the MCP ASGI app from FastMCP
     mcp_app = None
     try:
         mcp_app = mcp.streamable_http_app()  # type: ignore[attr-defined]
     except AttributeError:
-        try:
+        with suppress(AttributeError):
             mcp_app = mcp.sse_app()  # type: ignore[attr-defined]
-        except AttributeError:
-            pass
 
-    routes = [
+    routes: list[BaseRoute] = [
         Route("/v1/messages", endpoint=_proxy_messages, methods=["POST"]),
         Route("/health", endpoint=_health, methods=["GET"]),
     ]

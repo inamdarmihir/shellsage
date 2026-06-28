@@ -4,14 +4,22 @@ from shellsage.models import Shell
 from shellsage.rules import apply
 
 
-# Helper: run apply() and assert the result
+# Helper: run apply() and assert the result (only the translated string)
 def ps(cmd: str) -> str:
-    return apply(cmd, Shell.POWERSHELL)
+    translated, _ref = apply(cmd, Shell.POWERSHELL)
+    return translated
+
+
+def ps_ref(cmd: str) -> str:
+    """Return the ref URL for a PowerShell translation."""
+    _translated, ref = apply(cmd, Shell.POWERSHELL)
+    return ref
 
 
 def passthrough(cmd: str) -> str:
     """Commands that should pass through unchanged on bash."""
-    return apply(cmd, Shell.BASH)
+    translated, _ref = apply(cmd, Shell.BASH)
+    return translated
 
 
 # ── ls ────────────────────────────────────────────────────────────────────────
@@ -253,6 +261,7 @@ def test_unknown_command_passes_through():
     exotic = "some-unknown-tool --flag value"
     assert ps(exotic) == exotic
 
+
 # ── grep context lines & line numbers ────────────────────────────────────────
 
 
@@ -392,3 +401,50 @@ def test_multipass_pipe_grep_v_then_head():
     result = ps("some_tool | grep -v 'debug' | head -n 10")
     assert "notmatch" in result
     assert "Select-Object -First 10" in result
+
+
+# ── ref / citation tests ──────────────────────────────────────────────────────
+
+
+def test_ref_returned_for_ls():
+    ref = ps_ref("ls")
+    assert ref.startswith("https://learn.microsoft.com"), ref
+    assert "get-childitem" in ref.lower()
+
+
+def test_ref_returned_for_grep():
+    ref = ps_ref("grep 'error' app.log")
+    assert ref.startswith("https://learn.microsoft.com"), ref
+    assert "select-string" in ref.lower()
+
+
+def test_ref_returned_for_rm():
+    ref = ps_ref("rm -rf dist/")
+    assert ref.startswith("https://learn.microsoft.com"), ref
+    assert "remove-item" in ref.lower()
+
+
+def test_ref_returned_for_curl():
+    ref = ps_ref("curl https://api.example.com")
+    assert ref.startswith("https://learn.microsoft.com"), ref
+
+
+def test_ref_returned_for_find():
+    ref = ps_ref("find . -name '*.py'")
+    assert ref.startswith("https://learn.microsoft.com"), ref
+    assert "get-childitem" in ref.lower()
+
+
+def test_no_ref_on_bash_passthrough():
+    """apply() on bash shell returns empty ref — no translation needed."""
+    _translated, ref = apply("ls -la", Shell.BASH)
+    assert ref == ""
+
+
+def test_apply_returns_tuple():
+    result = apply("ls", Shell.POWERSHELL)
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    translated, ref = result
+    assert isinstance(translated, str)
+    assert isinstance(ref, str)

@@ -176,3 +176,44 @@ def test_os_enum_values():
     assert OS.WINDOWS.value == "windows"
     assert OS.MACOS.value == "macos"
     assert OS.LINUX.value == "linux"
+
+
+# ── Translation ref field ─────────────────────────────────────────────────────
+
+
+def test_translation_ref_default_empty():
+    t = Translation(
+        original="git status",
+        translated="git status",
+        shell=Shell.BASH,
+        confidence=1.0,
+        source="passthrough",
+    )
+    assert t.ref == ""
+
+
+def test_translation_ref_stored():
+    url = "https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-childitem"
+    t = Translation(
+        original="ls",
+        translated="Get-ChildItem",
+        shell=Shell.POWERSHELL,
+        confidence=0.95,
+        source="rules",
+        ref=url,
+    )
+    assert t.ref == url
+
+
+# ── CMD detection ─────────────────────────────────────────────────────────────
+
+
+def test_needs_translation_cmd_shell():
+    ctx = ShellContext(
+        os=OS.WINDOWS,
+        shell=Shell.CMD,
+        shell_version="unknown",
+        project_type="unknown",
+        project_root=".",
+    )
+    assert ctx.needs_translation is True

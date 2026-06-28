@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """PostToolUse hook — stores command outcomes back to local memory."""
-import hashlib, json, os, sys, tempfile
+
+import hashlib
+import json
+import os
+import sys
+import tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
     sys.exit(0)
 
-tool_input  = event.get("tool_input", {})
+tool_input = event.get("tool_input", {})
 tool_output = event.get("tool_response", {})
-command     = tool_input.get("command", "")
-exit_code   = tool_output.get("exit_code", 0)
-stderr      = tool_output.get("stderr", "")
+command = tool_input.get("command", "")
+exit_code = tool_output.get("exit_code", 0)
+stderr = tool_output.get("stderr", "")
 
 if not command:
     sys.exit(0)
@@ -21,14 +26,14 @@ try:
 
     ctx = ShellContext.get_cached()
 
-    original   = command
+    original = command
     translated = command
-    cmd_hash   = hashlib.md5(command.encode()).hexdigest()[:12]
+    cmd_hash = hashlib.md5(command.encode()).hexdigest()[:12]
     cache_path = os.path.join(tempfile.gettempdir(), f"shellsage_{cmd_hash}.json")
     try:
         with open(cache_path) as fh:
             cached = json.load(fh)
-        original   = cached.get("original", command)
+        original = cached.get("original", command)
         translated = cached.get("translated", command)
         os.remove(cache_path)
     except Exception:

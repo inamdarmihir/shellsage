@@ -30,6 +30,7 @@ def main() -> None:
 def setup(port: int, host: str) -> None:
     """Interactive one-command install wizard."""
     from shellsage.setup_wizard import run_wizard
+
     run_wizard(port=port, host=host)
 
 
@@ -74,9 +75,10 @@ def init(load_all: bool, limit: int, db_path: str) -> None:
         loaded += 1
 
     counts = store.get_stats(db_path)
-    console.print(f"  [green]OK[/green] {loaded} translations loaded  "
-                  f"(total in DB: {counts['translations']})")
-    console.print(f"\n[bold green]Ready.[/bold green]  Run setup wizard:")
+    console.print(
+        f"  [green]OK[/green] {loaded} translations loaded  (total in DB: {counts['translations']})"
+    )
+    console.print("\n[bold green]Ready.[/bold green]  Run setup wizard:")
     console.print("  [dim]shellsage setup[/dim]")
 
 
@@ -127,6 +129,7 @@ def stats(db_path: str) -> None:
     """Show local database counts."""
     try:
         from shellsage import store
+
         counts = store.get_stats(db_path)
     except Exception as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -151,6 +154,7 @@ def replay(limit: int, db_path: str) -> None:
     """Show recent failure patterns stored in local memory."""
     try:
         from shellsage import store
+
         failures = store.get_recent_failures(limit=limit, db_path=db_path)
     except Exception as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -182,8 +186,13 @@ def replay(limit: int, db_path: str) -> None:
 
 
 @main.command()
-@click.option("--http", "transport", flag_value="http", default=False,
-              help="Run as HTTP/SSE server instead of stdio.")
+@click.option(
+    "--http",
+    "transport",
+    flag_value="http",
+    default=False,
+    help="Run as HTTP/SSE server instead of stdio.",
+)
 @click.option("--port", default=SERVER_PORT, show_default=True, envvar="SHELLSAGE_PORT")
 @click.option("--host", default=SERVER_HOST, show_default=True, envvar="SHELLSAGE_HOST")
 def mcp(transport: str, port: int, host: str) -> None:
@@ -206,6 +215,7 @@ def mcp(transport: str, port: int, host: str) -> None:
 def start(port: int, host: str) -> None:
     """Start the MCP + proxy server as a background daemon."""
     import sys as _sys
+
     from shellsage.daemon import start_daemon
 
     result = start_daemon(port=port, host=host)
@@ -218,7 +228,7 @@ def start(port: int, host: str) -> None:
             f"[green]>[/green] ShellSage daemon started  "
             f"(PID {pid} | http://{host}:{actual_port}/sse)"
         )
-        console.print(f"\n[bold]MCP integration[/bold] — register with Claude Code:")
+        console.print("\n[bold]MCP integration[/bold] — register with Claude Code:")
         console.print(
             f"  [dim]claude mcp add --transport sse shellsage http://{host}:{actual_port}/sse[/dim]"
         )
@@ -226,7 +236,7 @@ def start(port: int, host: str) -> None:
             proxy_cmd = f'$env:ANTHROPIC_BASE_URL="http://{host}:{actual_port}"; claude'
         else:
             proxy_cmd = f"ANTHROPIC_BASE_URL=http://{host}:{actual_port} claude"
-        console.print(f"\n[bold]Proxy integration[/bold] — route all LLM calls through ShellSage:")
+        console.print("\n[bold]Proxy integration[/bold] — route all LLM calls through ShellSage:")
         console.print(f"  [dim]{proxy_cmd}[/dim]")
     elif result.get("reason") == "already_running":
         actual_port = result.get("port", port)
@@ -281,6 +291,7 @@ def status() -> None:
 
     try:
         from shellsage import store
+
         counts = store.get_stats()
         table.add_row("Translations", str(counts["translations"]))
         table.add_row("Failures", str(counts["failures"]))

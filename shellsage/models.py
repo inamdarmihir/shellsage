@@ -26,6 +26,7 @@ class OS(str, Enum):
 # Process-level cache: list-of-one so get_cached() can mutate it from a classmethod.
 _ctx_cache: list[ShellContext | None] = [None]
 
+
 @dataclass
 class ShellContext:
     """Runtime environment snapshot captured once per session."""
@@ -51,7 +52,7 @@ class ShellContext:
         )
 
     @classmethod
-    def get_cached(cls, project_root: str = ".") -> "ShellContext":
+    def get_cached(cls, project_root: str = ".") -> ShellContext:
         """Return a process-level cached context (avoids repeated subprocess spawns).
 
         Callers on hot paths (proxy, hooks) should prefer this over detect().
@@ -79,7 +80,8 @@ class Translation:
     translated: str
     shell: Shell
     confidence: float
-    source: str  # "qdrant" | "rules" | "passthrough"
+    source: str  # "rules" | "memory" | "passthrough"
+    ref: str = ""  # canonical docs URL when known; empty when unavailable
 
     @property
     def was_changed(self) -> bool:
@@ -118,17 +120,34 @@ def _detect_os() -> OS:
 
 
 def _detect_shell() -> tuple[Shell, str]:
-    """Return (Shell enum, version string)."""
+    """Return (Shell enum, version string).
+
+    Detection order:
+      1. $SHELL / $ComSpec env vars (most reliable on POSIX and Windows CMD)
+      2. $PSVersionTable presence (PowerShell sets this)
+      3. Platform fallback
+    """
     import os
 
-    shell_env = os.environ.get("SHELL", "")
+    shell_env = os.environ.get("SHELL", "").lower()
     if "zsh" in shell_env:
         return Shell.ZSH, _run_version("zsh --version")
     if "bash" in shell_env:
         return Shell.BASH, _run_version("bash --version")
+    if "fish" in shell_env:
+        return Shell.BASH, _run_version("fish --version")  # fish passthrough (no translation)
 
-    # Windows: prefer pwsh (7+) over powershell.exe (5.1)
+    # Windows: distinguish CMD from PowerShell via env vars that each sets.
     if platform.system().lower() == "windows":
+        # PSModulePath is injected by PowerShell; absent in plain cmd.exe.
+        in_powershell = bool(os.environ.get("PSMODULEPATH"))
+        # PROMPT is the default CMD prompt variable; PowerShell rarely sets it.
+        in_cmd = bool(os.environ.get("PROMPT")) and not in_powershell
+
+        if in_cmd:
+            return Shell.CMD, _run_version("cmd /c ver")
+
+        # PowerShell — prefer pwsh (7+) over powershell.exe (5.1)
         if _cmd_exists("pwsh"):
             return Shell.POWERSHELL, _run_version(
                 "pwsh -NoProfile -Command $PSVersionTable.PSVersion.ToString()"

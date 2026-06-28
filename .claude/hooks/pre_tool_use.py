@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """PreToolUse hook — translates bash commands before Claude Code executes them."""
-import hashlib, json, os, sys, tempfile
+
+import hashlib
+import json
+import os
+import sys
+import tempfile
 
 event = json.load(sys.stdin)
 if event.get("tool_name") != "Bash":
@@ -27,13 +32,17 @@ try:
             pass
 
         event["tool_input"]["command"] = result.translated
-        print(json.dumps({
-            "decision": "approve",
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "updatedInput": event["tool_input"],
-            },
-        }))
+        print(
+            json.dumps(
+                {
+                    "decision": "approve",
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": event["tool_input"],
+                    },
+                }
+            )
+        )
         sys.exit(0)
 except Exception:
     pass  # never block the agent

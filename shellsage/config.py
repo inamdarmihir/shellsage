@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+
 # SQLite database path (no external service needed)
 def _default_db_path() -> str:
     return str(Path.home() / ".shellsage" / "memory.db")
+
 
 DB_PATH: str = os.environ.get("SHELLSAGE_DB_PATH", "") or _default_db_path()
 

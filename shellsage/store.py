@@ -6,6 +6,7 @@ import hashlib
 import math
 import re
 import sqlite3
+from contextlib import suppress
 from pathlib import Path
 
 from shellsage.config import DB_PATH as _DEFAULT_DB
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS translations (
     project_type TEXT NOT NULL DEFAULT 'unknown',
     confidence  REAL NOT NULL DEFAULT 0.9,
     hits        INTEGER NOT NULL DEFAULT 1,
+    ref         TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
@@ -54,6 +56,11 @@ CREATE TABLE IF NOT EXISTS failures (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 """
+
+# Migration: add ref column to existing databases that pre-date this schema.
+_MIGRATIONS = [
+    "ALTER TABLE translations ADD COLUMN ref TEXT NOT NULL DEFAULT ''",
+]
 
 _FTS5_CREATE = """
 CREATE VIRTUAL TABLE IF NOT EXISTS translations_fts USING fts5(
@@ -81,9 +88,9 @@ END""",
 
 
 def ensure_tables(db_path: str | None = None) -> bool:
-    """Create schema. Returns True if FTS5 is available.
+    """Create schema and run migrations. Returns True if FTS5 is available.
 
-    Idempotent per process: subsequent calls for the same path are no-ops.
+    Idempotent per process: subsequent calls for the same path are a no-op.
     """
     path = db_path or _DEFAULT_DB
     if path in _ensured_paths:
@@ -94,6 +101,10 @@ def ensure_tables(db_path: str | None = None) -> bool:
             stmt = stmt.strip()
             if stmt:
                 conn.execute(stmt)
+        # Run migrations for existing DBs (ALTER TABLE is idempotent via try/except)
+        for migration in _MIGRATIONS:
+            with suppress(sqlite3.OperationalError):
+                conn.execute(migration)
     has_fts5 = _setup_fts5(conn)
     conn.close()
     _ensured_paths.add(path)
@@ -108,10 +119,8 @@ def _setup_fts5(conn: sqlite3.Connection) -> bool:
         conn.commit()
         return True
     except sqlite3.OperationalError:
-        try:
+        with suppress(Exception):
             conn.rollback()
-        except Exception:
-            pass
         return False
 
 
@@ -126,25 +135,25 @@ def upsert_translation(
     os_name: str,
     project_type: str,
     confidence: float,
+    ref: str = "",
     db_path: str | None = None,
 ) -> None:
     row_id = _stable_id(bash_cmd + shell + os_name)
     conn = _connect(db_path)
     with conn:
-        existing = conn.execute(
-            "SELECT hits FROM translations WHERE id = ?", (row_id,)
-        ).fetchone()
+        existing = conn.execute("SELECT hits FROM translations WHERE id = ?", (row_id,)).fetchone()
         hits = (existing["hits"] + 1) if existing else 1
         conn.execute(
             """
-            INSERT INTO translations(id, bash_cmd, translated_cmd, shell, os_name, project_type, confidence, hits)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO translations(id, bash_cmd, translated_cmd, shell, os_name, project_type, confidence, hits, ref)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 translated_cmd = excluded.translated_cmd,
                 confidence     = excluded.confidence,
-                hits           = excluded.hits
+                hits           = excluded.hits,
+                ref            = excluded.ref
             """,
-            (row_id, bash_cmd, translated_cmd, shell, os_name, project_type, confidence, hits),
+            (row_id, bash_cmd, translated_cmd, shell, os_name, project_type, confidence, hits, ref),
         )
     conn.close()
 
@@ -178,7 +187,7 @@ def query_translation(
 
     # FTS5 unavailable: Python-side BM25 over a bounded corpus (≤500 rows).
     rows = conn.execute(
-        "SELECT bash_cmd, translated_cmd, confidence, hits "
+        "SELECT bash_cmd, translated_cmd, confidence, hits, ref "
         "FROM translations WHERE os_name=? AND shell=? LIMIT 500",
         (os_name, shell),
     ).fetchall()
@@ -188,8 +197,13 @@ def query_translation(
         return []
 
     docs = [
-        {"bash_cmd": r["bash_cmd"], "translated_cmd": r["translated_cmd"],
-         "confidence": r["confidence"], "hits": r["hits"]}
+        {
+            "bash_cmd": r["bash_cmd"],
+            "translated_cmd": r["translated_cmd"],
+            "confidence": r["confidence"],
+            "hits": r["hits"],
+            "ref": r["ref"],
+        }
         for r in rows
     ]
     scored = _bm25_scores(bash_cmd, docs)
@@ -218,7 +232,7 @@ def _query_fts5(
     try:
         rows = conn.execute(
             """
-            SELECT t.bash_cmd, t.translated_cmd, t.confidence, t.hits,
+            SELECT t.bash_cmd, t.translated_cmd, t.confidence, t.hits, t.ref,
                    -bm25(translations_fts) AS raw_score
             FROM translations_fts fts
             JOIN translations t ON fts.rowid = t.rowid
@@ -241,13 +255,16 @@ def _query_fts5(
     for row in rows:
         norm = min(0.97, row["raw_score"] / max(max_score, 1e-9))
         if norm >= score_threshold:
-            results.append({
-                "bash_cmd": row["bash_cmd"],
-                "translated_cmd": row["translated_cmd"],
-                "confidence": row["confidence"],
-                "hits": row["hits"],
-                "score": norm,
-            })
+            results.append(
+                {
+                    "bash_cmd": row["bash_cmd"],
+                    "translated_cmd": row["translated_cmd"],
+                    "confidence": row["confidence"],
+                    "hits": row["hits"],
+                    "ref": row["ref"],
+                    "score": norm,
+                }
+            )
     return results[:limit]
 
 

@@ -106,23 +106,31 @@ def start_daemon(port: int = 7842, host: str = "127.0.0.1") -> dict:
     actual_port = _find_available_port(port, host)
 
     cmd = [
-        sys.executable, "-m", "shellsage",
-        "mcp", "--http", "--port", str(actual_port), "--host", host,
+        sys.executable,
+        "-m",
+        "shellsage",
+        "mcp",
+        "--http",
+        "--port",
+        str(actual_port),
+        "--host",
+        host,
     ]
 
-    log = open(log_path(), "a")
-    kwargs: dict = {
-        "stdout": log,
-        "stderr": log,
-        "stdin": subprocess.DEVNULL,
-    }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    else:
-        kwargs["start_new_session"] = True
+    with open(log_path(), "a") as log:
+        kwargs: dict = {
+            "stdout": log,
+            "stderr": log,
+            "stdin": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+        else:
+            kwargs["start_new_session"] = True
 
-    proc = subprocess.Popen(cmd, **kwargs)
-    log.close()
+        proc = subprocess.Popen(cmd, **kwargs)
 
     state = {"pid": proc.pid, "port": actual_port, "host": host}
     _state_path().write_text(json.dumps(state))
@@ -147,6 +155,7 @@ def stop_daemon() -> dict:
         else:
             import os
             import signal
+
             os.kill(pid, signal.SIGTERM)
         _state_path().unlink(missing_ok=True)
         return {"stopped": True, "pid": pid}
