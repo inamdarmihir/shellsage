@@ -21,3 +21,6 @@ env/
 
 # User-local Claude Code settings (machine-specific permissions)
 .claude/settings.local.json
+
+# MkDocs build output
+site/

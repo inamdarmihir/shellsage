@@ -1,0 +1,44 @@
+/* ── Hero block ─────────────────────────────────────────────────── */
+.hero {
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+.hero pre {
+  display: inline-block;
+  text-align: left;
+  font-size: 0.55rem;
+  line-height: 1.2;
+  color: var(--md-primary-fg-color);
+  background: transparent;
+  border: none;
+  padding: 0;
+  overflow-x: auto;
+}
+
+@media (max-width: 600px) {
+  .hero pre {
+    font-size: 0.38rem;
+  }
+}
+
+/* ── Grid cards ─────────────────────────────────────────────────── */
+.md-typeset .grid.cards > ul > li {
+  border-radius: 6px;
+}
+
+/* ── Code blocks ────────────────────────────────────────────────── */
+.md-typeset code {
+  font-size: 0.85em;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────── */
+.md-typeset table:not([class]) th {
+  background-color: var(--md-primary-fg-color);
+  color: var(--md-primary-bg-color);
+}
+
+/* ── Mermaid ────────────────────────────────────────────────────── */
+.mermaid {
+  text-align: center;
+}
